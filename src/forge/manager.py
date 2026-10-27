@@ -104,32 +104,37 @@ class Manager:
     def create(self, repository_id, identifier, *, dry_run=False):
         task_id(identifier)
         with self.registry.locked(write=not dry_run) as data:
+            return self._create_locked(data, repository_id, identifier, dry_run=dry_run)
+
+    def _create_locked(self, data, repository_id, identifier, *, dry_run=False, commit=None):
+        self._config(data)
+        repo = self._approved(data, repository_id)
+        previous = self._task(data, repository_id, identifier)
+        if previous:
+            self._validate_worktree(repo, previous)
+            return result("create", dry_run, already_exists=True, **previous)
+        if commit is not None and git(repo, "rev-parse", "--verify", "HEAD^{commit}") != commit:
+            raise SafetyError("approved commit differs from local HEAD")
+        clean(repo)
+        nonce = secrets.token_hex(12)
+        branch = branch_name("forge/" + repository_id + "/" + identifier + "-" + nonce)
+        path = checked_path(self.work / (repository_id + "-" + identifier + "-" + nonce), missing=True)
+        if path.exists():
+            raise SafetyError("worktree destination already exists")
+        record = {"path": str(path), "branch": branch}
+        if not dry_run:
             self._config(data)
-            repo = self._approved(data, repository_id)
-            previous = self._task(data, repository_id, identifier)
-            if previous:
-                self._validate_worktree(repo, previous)
-                return result("create", dry_run, already_exists=True, **previous)
-            clean(repo)
-            nonce = secrets.token_hex(12)
-            branch = branch_name("forge/" + repository_id + "/" + identifier + "-" + nonce)
-            path = checked_path(self.work / (repository_id + "-" + identifier + "-" + nonce), missing=True)
-            if path.exists():
-                raise SafetyError("worktree destination already exists")
-            record = {"path": str(path), "branch": branch}
-            if not dry_run:
-                self._config(data)
-                self._approved(data, repository_id)
-                record["state"] = "creating"
-                data["tasks"][repository_id + ":" + identifier] = record
-                self.registry.checkpoint(data)
-                git(repo, "worktree", "add", "--no-track", "-b", branch, str(path), "HEAD")
-                self._config(data)
-                record["identity"] = identity(path)
-                record["state"] = "active"
-                self._validate_worktree(repo, record)
-                data["tasks"][repository_id + ":" + identifier] = record
-            return result("create", dry_run, already_exists=False, **record)
+            self._approved(data, repository_id)
+            record["state"] = "creating"
+            data["tasks"][repository_id + ":" + identifier] = record
+            self.registry.checkpoint(data)
+            git(repo, "worktree", "add", "--no-track", "-b", branch, str(path), commit or "HEAD")
+            self._config(data)
+            record["identity"] = identity(path)
+            record["state"] = "active"
+            self._validate_worktree(repo, record)
+            data["tasks"][repository_id + ":" + identifier] = record
+        return result("create", dry_run, already_exists=False, **record)
 
     def cleanup(self, repository_id, identifier, *, dry_run=False):
         task_id(identifier)
