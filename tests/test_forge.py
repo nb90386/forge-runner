@@ -4,9 +4,13 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+
+# Make the src layout importable during discovery without installing the package.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from forge import Manager, SafetyError
 from forge.__main__ import main

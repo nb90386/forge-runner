@@ -46,7 +46,7 @@ characters, and are generated internally; callers cannot supply Git arguments.
 Run from this checkout:
 
 ```sh
-PYTHONPATH=src python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tests -v
 python3 -m compileall -q src tests
 PYTHONPATH=src python3 -m forge --help
 PYTHONPATH=src python3 -m forge --registry /private/local/state --allowed-root /private/local --worktree-root /private/local/work --dry-run approve example /private/local/source
