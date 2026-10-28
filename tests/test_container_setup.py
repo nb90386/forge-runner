@@ -28,6 +28,57 @@ def image():
 
 
 class SetupTests(unittest.TestCase):
+    def test_hub_familiar_and_canonical_digest_metadata(self):
+        suffix = '@sha256:' + 'a' * 64
+        names = ('python', 'library/python', 'docker.io/python',
+                 'docker.io/library/python', 'index.docker.io/library/python')
+        for supplied in names:
+            for stored in names:
+                with self.subTest(supplied=supplied, stored=stored):
+                    obj = image(); obj['RepoDigests'] = [stored + suffix]
+                    engine = Mock(); engine._json.return_value = [obj]
+                    self.assertEqual(setup.inspect_image(engine, supplied + suffix, IID)['Id'], IID)
+                    # The runtime must enforce the same digest interpretation.
+                    runtime = object.__new__(setup.ContainerAdapter)
+                    runtime.config = ContainerConfig('/docker', '/socket', supplied + suffix, IID)
+                    runtime._image_id = IID
+                    runtime._json = engine._json
+                    runtime._check_image()
+                    engine._json.assert_called_with(['image', 'inspect', supplied + suffix])
+
+    def test_digest_evidence_mismatches_fail_closed_before_build(self):
+        suffix = '@sha256:' + 'a' * 64
+        reference = 'python' + suffix
+        for evidence in (None, [], {}, 'python' + suffix,
+                         [IID], ['python:latest'],
+                         ['docker.io/library/python@sha256:' + 'c' * 64],
+                         ['evil.invalid/library/python' + suffix],
+                         ['registry-1.docker.io/library/python' + suffix],
+                         ['docker.io/attacker/python' + suffix],
+                         ['docker.io/library/python-evil' + suffix],
+                         ['docker.io/library/python@sha512:' + 'a' * 64],
+                         ['docker.io/library/python@sha256:' + 'a' * 63],
+                         [None, {}, 'python:latest']):
+            with self.subTest(evidence=evidence):
+                obj = image(); obj['RepoDigests'] = evidence
+                # A matching ID/tag/descriptor cannot replace RepoDigests.
+                obj['RepoTags'] = ['python:latest']
+                obj['Descriptor'] = {'digest': 'sha256:' + 'a' * 64}
+                runtime = object.__new__(setup.ContainerAdapter)
+                runtime.config = ContainerConfig('/docker', '/socket', reference, IID)
+                runtime._image_id = IID
+                runtime._json = Mock(return_value=[obj])
+                with self.assertRaises(SafetyError):
+                    runtime._check_image()
+                with patch.object(setup, 'ContainerAdapter') as adapter:
+                    adapter.return_value._json.return_value = [obj]
+                    error = io.StringIO()
+                    with contextlib.redirect_stderr(error):
+                        self.assertEqual(setup.main(['build', '--docker', '/docker',
+                            '--socket', '/socket', '--base', reference, '--trust-base']), 1)
+                    self.assertIn('BLOCKED', error.getvalue())
+                    adapter.return_value._cli.assert_not_called()
+
     def test_build_sends_only_reviewed_context_and_records_id(self):
         commands = []
         def cli(args, **kwargs):

@@ -146,6 +146,44 @@ Neither result is an agent execution permit. LEASES.md blockers remain unchanged
 
 ## Diagnostics and cleanup
 
+### Docker 29 digest metadata compatibility
+
+Setup and runtime compare repository digest evidence after Docker Hub name
+normalization: `python`, `library/python`, `docker.io/python`, and
+`docker.io/library/python` name the same repository (as does the legacy
+`index.docker.io` spelling). The SHA256 digest must still match exactly.
+Other registry hosts, ports, namespaces and repository paths remain distinct;
+`registry-1.docker.io` is not treated as an alias. The supplied digest reference
+is still used for inspection and the build argument; provenance approval,
+platform checks, immutable image selection and build flags are unchanged.
+
+The former literal string comparison rejected equivalent Hub names. This is a
+code-level cause, not a confirmed diagnosis of the local OrbStack installation:
+read-only daemon inspection in this session was denied socket access, so neither
+the actual RepoDigests representation nor its absence could be established.
+Regression tests use synthetic canonical/familiar metadata, not captured daemon
+output. Docker 29 alone does not establish which metadata the engine returns.
+
+Missing, empty or mismatched RepoDigests remains **BLOCKED**, even when inspection
+by digest succeeds or an image ID, tag or Descriptor digest matches. No such
+field alone proves the approved repository-to-manifest association. Do not
+derive a manifest digest from the local configuration ID or edit engine metadata.
+
+Safe provisioning alternative (a separate operator action, not performed here):
+use an approved engine/distribution process that preserves inspectable repository
+digests. Independently verify the approved publisher and registry manifest bytes
+against the trusted SHA256 digest. For a multiarch index, verify the index digest,
+its Linux ARM64 child manifest digest, and the child's configuration digest.
+Provision that exact repository digest on the selected trusted engine, then
+confirm RepoDigests, Linux/arm64 and the configuration ID before retrying setup.
+If this engine cannot expose the required association, use a separately approved
+compatible engine; the fixture build stays blocked on this one. An archive or
+local tag without that association is insufficient. This does not authorize a
+pull, push, registry deployment or engine reconfiguration from this session.
+
+Normalization follows the upstream
+[Docker reference implementation](https://github.com/distribution/reference/blob/main/normalize.go).
+
 Setup exits 1 with a runner-owned refusal message, avoiding daemon error/secret leakage.
 Use the sanitized engine helper for targeted `version`, `info`, `image inspect`
 and `ps --all --filter name=forge-fixture-` inspection locally. Permission denied

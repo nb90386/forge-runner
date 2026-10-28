@@ -19,6 +19,32 @@ import uuid
 from .safety import SafetyError, checked_path
 
 
+def has_repository_digest(image, reference):
+    """Match SHA256 provenance, allowing only Docker Hub name aliases.
+
+    Never infer registry provenance from an image ID, tag, or descriptor.
+    Keep non-Hub registries (including registry-1.docker.io) distinct.
+    """
+    def canonical(value):
+        if not isinstance(value, str) or not re.fullmatch(
+                r'[a-z0-9][a-z0-9./:_-]*@sha256:[0-9a-f]{64}', value):
+            return None
+        repository, digest = value.split('@')
+        first, separator, rest = repository.partition('/')
+        if not separator:
+            repository = 'docker.io/library/' + repository
+        elif first in ('docker.io', 'index.docker.io'):
+            repository = 'docker.io/' + (rest if '/' in rest else 'library/' + rest)
+        elif first != 'localhost' and '.' not in first and ':' not in first:
+            repository = 'docker.io/' + repository
+        return repository + '@' + digest
+
+    expected = canonical(reference)
+    digests = image.get('RepoDigests')
+    return (expected is not None and isinstance(digests, list)
+            and any(canonical(value) == expected for value in digests))
+
+
 @dataclass(frozen=True)
 class ContainerConfig:
     executable: str
@@ -159,7 +185,7 @@ class ContainerAdapter:
         image_id = image.get('Id', '')
         if (not re.fullmatch(r'sha256:[0-9a-f]{64}', image_id)
                 or (self._image_id is not None and image_id != self._image_id)
-                or self.config.image not in image.get('RepoDigests', []) or image['Config'].get('Volumes')
+                or not has_repository_digest(image, self.config.image) or image['Config'].get('Volumes')
                 or any(not value.startswith('PATH=') for value in image['Config'].get('Env') or [])):
             raise SafetyError('image digest, ID, volumes or environment refused')
         self._image_id = image_id

@@ -9,7 +9,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'src'))
-from forge.container import ContainerAdapter, ContainerConfig
+from forge.container import ContainerAdapter, ContainerConfig, has_repository_digest
 from forge.conformance import run
 from forge.safety import SafetyError
 
@@ -26,7 +26,10 @@ def pinned(value):
 def inspect_image(adapter, reference, expected_id=None, fixture=False):
     obj, = adapter._json(['image', 'inspect', reference])
     cfg = obj['Config']
-    if (reference not in obj.get('RepoDigests', []) or obj.get('Os') != 'linux'
+    if not has_repository_digest(obj, reference):
+        raise SafetyError('BLOCKED: trusted local repository digest evidence unavailable; '
+                          'use independently verified provisioning (see fixture README)')
+    if (obj.get('Os') != 'linux'
             or obj.get('Architecture') != 'arm64'
             or not re.fullmatch(r'sha256:[0-9a-f]{64}', obj.get('Id', ''))):
         raise SafetyError('exact local Linux ARM64 repository digest required')
