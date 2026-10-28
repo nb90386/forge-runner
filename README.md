@@ -208,3 +208,62 @@ local Git preparation/inspection and connections to the test listener. No Claude
 Codex, shell task, merge, deployment, production, existing credentials, or existing
 project is used. The temporary manifest is verified and then removed with all
 fixture state; the server is terminated and reaped even on failure.
+
+## Forge 0.6B — isolated runtime foundation (fail closed)
+
+`forge.runtime` separates trusted local runtime configuration from untrusted job
+content. It is deliberately disconnected from dispatch and the server execution
+lease APIs. Real Claude/Codex execution remains disabled, with no enable switch.
+No server settings, production code, credentials or services are changed.
+
+```python
+from forge.runtime import Runtime, SyntheticRequest, detect_capabilities
+
+inventory = detect_capabilities()  # passive executable discovery only
+runtime = Runtime(['/private/local/work/explicit-task-directory'])
+result = runtime.execute(SyntheticRequest('/private/local/work/explicit-task-directory'))
+manifest = result.manifest()  # JSON serializable audit; unsupported, started=False
+```
+
+The approved list is explicit trusted operator configuration of exact directories;
+parent approval does not approve children. Paths must be canonical, contain no
+symlink components, and retain recorded ancestor device/inode identities. These
+checks are defense in depth, **not isolation or execution authorization**. A
+worktree and a preparation manifest are never security boundaries or permits.
+Worktree contents are never opened, imported, or executed by this module.
+
+Inventory detects Docker (including an OrbStack-provided Docker CLI), Podman,
+nerdctl, macOS sandbox-exec, and bubblewrap executables without invoking them.
+Presence does not verify a daemon, VM sharing, filesystem isolation, network
+isolation, resource enforcement or process-tree termination. All mechanisms are
+reported unverified and unsupported. There is no approved container adapter in
+this milestone and no host execution fallback. No images are pulled or built.
+
+Only runner-owned synthetic identifiers are accepted: noop, capture-fixture,
+artifact-fixture, timeout-fixture, cancel-fixture and resource-fixture. These
+reserve future fixed test implementations; they do not execute today. Requests
+have no command, shell, description, environment, credential or mount fields.
+Network must be literal False. Workspace access is explicitly ro or rw. CPU,
+memory, process, wall-time, termination-grace, stdout/stderr byte and artifact
+count/total-byte requests have finite positive upper bounds; invalid or unsupported
+configurations are rejected. Valid requests return structured `unsupported`.
+A trusted Cancellation signal can return `canceled` before start.
+
+Results include status, reason, started flag, empty bounded capture fields and a
+JSON audit manifest recording requested limits, capabilities, and explicitly
+unverified guarantees. The manifest is returned to the trusted caller, not written
+into an untrusted workspace. It contains no job descriptions or credentials and
+is not an execution permit. This runtime neither claims nor acknowledges leases.
+
+**Actually enforced:** no execution, no network connections, no mount creation,
+no credential loading, exact workspace admission, synthetic operation allowlist,
+configuration bounds and empty capture. **Unverified / release blockers:** actual
+read/write filesystem boundary, home/credential exclusion during execution,
+network denial inside a runtime, CPU/memory/process limits, monotonic wall-time
+kill, streaming capture/artifact limits, and graceful cancellation followed by
+forced termination of an entire isolated process tree. The interface documents
+these future backend obligations; it does not simulate successful enforcement.
+Tests verify timeout/cancellation/resource/capture requests fail closed, not that
+an OS enforces those limits. Enabling a backend requires disposable isolation
+conformance tests, including hostile symlinks and cleanup failures, plus separate
+lease integration and durable execution fencing. No agent execution is authorized.
