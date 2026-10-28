@@ -287,3 +287,55 @@ Actual agent execution is unconditionally disabled. Portable process-group
 signaling cannot attest whole-tree containment, and the watchdog thread is not
 an OS-supervised process. See [LEASES.md](LEASES.md) for the API, test commands,
 and remaining execution blockers.
+
+## Forge 0.6F — operator live isolation conformance
+
+The separate `forge.conformance` command runs the existing fixed disposable
+container probes directly; it does not rely on unittest success or skip counts.
+It never enables agents or connects container attestation to leases. Images must
+be independently audited and provisioned locally by the operator. There is no
+trusted default image, pull, build, dependency installation or credential discovery.
+Only the explicitly selected digest is inspected; other local images are not
+implicitly approved. Docker/OrbStack executable inventory is passive and never
+proves daemon availability or isolation. OrbStack uses its Docker-compatible CLI
+and an explicit canonical Unix socket; no Docker context is read.
+
+On your Mac, substitute the three audited local values and run from this checkout:
+
+```sh
+PYTHONPATH=src python3 -m forge.conformance --live \
+  --docker /CANONICAL/PATH/TO/docker \
+  --socket /CANONICAL/PATH/TO/docker.sock \
+  --image 'AUDITED-REPOSITORY@sha256:64-LOWERCASE-HEX-DIGEST' \
+  --approve-image 'AUDITED-REPOSITORY@sha256:64-LOWERCASE-HEX-DIGEST'
+```
+
+Both image arguments must be identical. Paths must satisfy the existing strict
+ownership, permissions and no-symlink checks, including all ancestors. Do not use
+an ordinary symlink to the CLI or socket; supply the canonical approved target.
+The image requirements and trusted-daemon boundary from 0.6C still apply. No host
+workspace, real secret, repository code or production service enters the fixtures.
+A missing or inaccessible daemon, unavailable local digest, unsupported limits,
+failed probe or uncertain cleanup blocks conformance; investigate cleanup failures
+before retrying. The runner does not remove unrelated containers.
+
+Stdout contains one JSON report with prerequisite, daemon/image and disposable
+probe outcomes plus guarantee coverage. Exit codes are **0 PASS**, **1 FAIL**, and
+**2 UNVERIFIED**. Missing opt-in/settings produce UNVERIFIED without daemon access.
+Failures leave guarantees UNVERIFIED; only completion of every live probe and
+confirmed removal marks them PASS. Reports are evidence for this invocation,
+never persisted execution permits. A skipped live unittest remains UNVERIFIED.
+The probes cover filesystem and symlink boundaries, network denial, effective
+CPU/memory/PID settings and cgroup bounds, resource exhaustion, ignored-TERM child
+timeout/cancellation, capped streams, bounded artifact collection and removal.
+CPU scheduling fairness and host-crash cleanup are not attested by these probes.
+
+Offline verification (no live engine, agents or production connections):
+
+```sh
+PYTHONPATH=src:tests python3 -m unittest test_conformance test_container.ContainerTests test_runtime test_lease test_lease_http -q
+python3 -m compileall -q src tests
+```
+
+The lease HTTP tests use only synthetic loopback authorities and can skip when
+loopback binding is denied; those skips provide no live isolation evidence.

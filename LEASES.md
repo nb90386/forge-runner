@@ -141,3 +141,14 @@ The server is a test double, not proof of real control-plane audit/storage behav
 Loopback tests explicitly skip when the host sandbox denies binding; wire tests
 still run without sockets. No agents, production services or real credentials are
 used. Existing 0.6D tests remain unchanged.
+
+## Forge 0.6F: separate operator isolation check
+
+`PYTHONPATH=src python3 -m forge.conformance` emits UNVERIFIED and exits 2 without
+explicit live configuration. See README.md for the complete Mac live command and
+local audited image prerequisites. The opt-in runner exercises only the existing
+fixed disposable container fixtures and reports PASS only after complete live
+conformance with confirmed removal. Missing prerequisites and skips cannot attest
+isolation. Reports do not authorize execution, satisfy lease supervisor blockers,
+or connect Runtime/ContainerAdapter to either lease worker. All 0.6D/0.6E execution
+refusals and remaining integration requirements above remain in force.
