@@ -78,3 +78,66 @@ Offline verification: `PYTHONPATH=src:tests python3 -m unittest test_lease
  test_forge.ValidationTests` (join as one command), plus
 `python3 -m compileall -q src tests`. Existing Git lifecycle, real HTTP staging and
 live container suites are excluded because they launch processes or services.
+
+## Forge 0.6E: opt-in loopback lease integration
+
+`forge.lease_http.HTTPLeaseTransport(origin, secret_provider, timeout=2)` accepts
+only explicit numeric-loopback HTTP origins. It obtains a dedicated execution
+secret once from the caller's configuration-time callable. It never discovers
+credentials, reads the environment, retries writes, follows redirects, uses DNS,
+or contacts a configured service automatically. Rotation requires a fresh
+transport. Protect and authenticate the local listener/tunnel independently.
+
+`HTTPLeaseWorker(registry, transport, worker_id, poll_interval=.25)` retains the
+0.6D durable job/approval tombstones and unconditional `execute` refusal. It can
+claim, acknowledge, heartbeat, rotate, and report synthetic terminal status using
+the exact execution endpoints documented in the read-only control-plane checkout.
+Responses require exact fields, finite and consistent timestamps, pinned bindings,
+integer generations, opaque server-format credentials, and the documented HTTP
+framing and no-store headers. Duplicate JSON keys and unknown fields are refused.
+Future server timestamps are refused rather than assuming a clock-skew allowance.
+No server audit atomicity can be proved from this worker response alone.
+
+The transport limits request/response bodies to 4096 bytes. An independent socket
+shutdown timer bounds the entire connected I/O exchange (including slow-drip
+headers/body), with a configurable timeout in `(0, 5]` seconds. There are no claim,
+renewal, or credential recovery retries after ambiguous outcomes. A separate
+polling thread checks remote cancellation every configured interval (`.01` to `1`
+second), plus transport time and scheduling delay. While claimed it uses renewal;
+after acknowledgment it uses heartbeat without extending the lease. Operators
+must explicitly request renewal once running. No worker cancellation endpoint is
+invented: local cancellation stops locally; remote cancellation is a rejection.
+
+A separate trusted watchdog thread checks local monotonic deadlines and local
+cancellation at most every 50 ms of scheduled running time, independent of the
+caller, network and registry locks. It terminates the synthetic boundary before
+attempting durable writes. A late response cannot restore authority after the
+watchdog has stopped it. Response delay consumes the request-start deadline;
+renewal must also arrive within the old deadline. Wall rollback never extends an
+existing deadline. Pending claims have the transport timeout as their deadline.
+Use `close()` to stop and join background loops; do not reuse a closed worker.
+
+Startup reconciliation converts unresolved local records to `blocked`, preserving
+identity and attempt digests. No credentials or persisted monotonic deadlines are
+recovered. Every existing record still fences another claim. Persistence failures
+leave the earlier intent as the fence; diagnostics contain fixed messages rather
+than request bodies, credentials, server errors, or exception details.
+
+`ProcessGroupCancellation` provides explicit TERM/KILL signaling for an externally
+owned POSIX process group, without launching or discovering processes. It always
+reports cleanup uncertainty: portable process groups cannot prove the absence of
+escaped descendants. It is deliberately **not accepted as an execution supervisor**.
+The only accepted supervisor remains synthetic and execution remains disabled.
+The watchdog thread cannot survive interpreter failure, establish OS isolation,
+or provide a host-suspension or scheduler-independent termination guarantee.
+A separate OS-supervised watchdog and verified containment are still release
+blockers for actual agent execution. No Runtime/ContainerAdapter wiring is added.
+
+Verification includes `test_lease_http`: a local fake HTTP authority and byte-level
+HTTPConnection fixtures cover claims, renewals, stale fencing, expiry independent
+of caller locks, cancellation polling, lost replies, bounded stalled I/O,
+reconciliation, redaction, strict parsing and simulated persisted server restart.
+The server is a test double, not proof of real control-plane audit/storage behavior.
+Loopback tests explicitly skip when the host sandbox denies binding; wire tests
+still run without sockets. No agents, production services or real credentials are
+used. Existing 0.6D tests remain unchanged.

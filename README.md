@@ -275,3 +275,15 @@ suite is **unverified**, never a successful conformance result. This development
 session found the OrbStack CLI but daemon socket access was denied; no actual
 container isolation guarantee was verified here. No production or control-plane
 changes are required or authorized by this milestone.
+
+### Forge 0.6E lease transport (execution disabled)
+
+The opt-in `forge.lease_http` module adds authenticated numeric-loopback HTTP
+lease bookkeeping, strict response validation, bounded I/O, monotonic watchdog
+and cancellation polling, and durable fail-closed restart reconciliation. It
+accepts an explicitly injected execution secret; it performs no credential
+discovery and is not connected to the runner CLI, Runtime, or ContainerAdapter.
+Actual agent execution is unconditionally disabled. Portable process-group
+signaling cannot attest whole-tree containment, and the watchdog thread is not
+an OS-supervised process. See [LEASES.md](LEASES.md) for the API, test commands,
+and remaining execution blockers.

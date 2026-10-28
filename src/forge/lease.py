@@ -186,6 +186,7 @@ class LeaseWorker:
         self.registry, self.transport, self.worker_id = registry, transport, worker_id
         self.clock, self.supervisor = clock, supervisor
         self._lock = RLock()
+        self._authority_lock = RLock()
         self._permit = None
         self._deadline = None
         self._job = None
@@ -196,9 +197,10 @@ class LeaseWorker:
                 'synthetic_active': self.supervisor.active, 'terminated': self.supervisor.terminated}
 
     def _stop(self):
-        self.supervisor.terminate()
-        self._permit = None
-        self._deadline = None
+        with self._authority_lock:
+            self.supervisor.terminate()
+            self._permit = None
+            self._deadline = None
 
     def _save(self, state, generation):
         with self.registry.locked(write=True) as data:
@@ -235,7 +237,10 @@ class LeaseWorker:
         start, wall = self.clock.monotonic, self.clock.wall
         old = self._permit
         try:
+            if self.supervisor.terminated:
+                refuse()
             response = self.transport.request(action, payload, self.worker_id)
+            self._validate_response(response, action)
             expected = binding(self._job, self.worker_id)
             generation = 1 if action == 'claim' else old['generation'] + (action == 'renew')
             state = ('claimed' if action == 'claim' else payload['state'] if action == 'finish'
@@ -261,9 +266,12 @@ class LeaseWorker:
                     old is not None and self.clock.monotonic >= self._deadline):
                 refuse()
             self._save(state, generation)
-            self._permit = {**expected, 'generation': generation, 'lease_credential': credential,
-                            'state': state, 'expires_at': expiry}
-            self._deadline = deadline
+            with self._authority_lock:
+                if self.supervisor.terminated:
+                    refuse()
+                self._permit = {**expected, 'generation': generation, 'lease_credential': credential,
+                                'state': state, 'expires_at': expiry}
+                self._deadline = deadline
             if state in TERMINAL:
                 self._stop()
             return self.manifest()
@@ -275,12 +283,17 @@ class LeaseWorker:
                 pass  # durable claim intent still fences restart
             raise SafetyError('lease: operation uncertain; supervisor terminated') from None
 
+    def _validate_response(self, response, action):
+        """Additional transport-specific contract checks, inside the stop boundary."""
+
     def step(self, action='heartbeat', *, state=None):
         with self._lock:
-            if (self._permit is None or self.clock.monotonic >= self._deadline
+            with self._authority_lock:
+                permit, deadline = self._permit, self._deadline
+            if (permit is None or deadline is None or self.clock.monotonic >= deadline
                     or self.supervisor.cancellation.requested):
-                if self._permit is not None:
-                    generation = self._permit['generation']
+                if permit is not None:
+                    generation = permit['generation']
                     state = 'canceled' if self.supervisor.cancellation.requested else 'expired'
                     self._stop()
                     self._save(state, generation)
@@ -289,7 +302,7 @@ class LeaseWorker:
             if action not in ('acknowledge', 'heartbeat', 'renew', 'finish'):
                 self._stop()
                 refuse()
-            payload = {k: self._permit[k] for k in ('job_id', 'generation', 'lease_credential')}
+            payload = {k: permit[k] for k in ('job_id', 'generation', 'lease_credential')}
             if action == 'finish':
                 payload['state'] = state
             return self._request(action, payload)
