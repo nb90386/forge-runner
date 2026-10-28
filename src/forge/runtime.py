@@ -1,12 +1,12 @@
-"""Fail-closed isolation foundation. No execution backend is approved in 0.6B.
+"""Fail-closed synthetic runtime. Inventory is not isolation attestation.
 
-Inventory is not attestation. This module never starts a subprocess, reads agent
-credentials, consumes a preparation manifest, or contacts execution-lease APIs.
+No agent execution, credential loading, preparation manifests or lease APIs.
 """
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 import math
 import shutil
+import tempfile
 from threading import Event
 from typing import Protocol
 
@@ -129,9 +129,13 @@ class Runtime:
     """Trusted local configuration, separate from dispatch and untrusted content.
 
     Explicit paths are exact, identity-pinned, in-memory operator configuration,
-    not authorization to execute agents. No adapter injection/enable switch exists.
+    not authorization to execute agents. Only the typed container adapter is accepted.
     """
-    def __init__(self, approved_worktrees=()):
+    def __init__(self, approved_worktrees=(), *, container=None):
+        from .container import ContainerAdapter
+        if container is not None and type(container) is not ContainerAdapter:
+            raise SafetyError("typed container adapter required")
+        self._container = container
         self._approved = {}
         for value in approved_worktrees:
             path = checked_path(value)
@@ -172,4 +176,19 @@ class Runtime:
         if cancellation is not None and cancellation.requested:
             return outcome('canceled', 'canceled_before_start')
         audit['capabilities'] = [asdict(item) for item in detect_capabilities()]
-        return outcome('unsupported', 'no_verified_isolation_backend')
+        if self._container is None:
+            return outcome('unsupported', 'no_verified_isolation_backend')
+        # Synthetic workspaces are empty disposable admission tokens. No host
+        # directory is mounted, copied, or executed, including approved content.
+        if Path(tempfile.gettempdir()).resolve() not in path.parents or any(path.iterdir()):
+            return outcome('rejected', 'empty_disposable_workspace_required')
+        try:
+            status, code, stdout, stderr, artifacts = self._container.execute(request, cancellation)
+        except Exception:
+            return ExecutionResult('unsupported', 'container_isolation_or_cleanup_unverified',
+                                   audit, started=self._container._attested)
+        audit.update(adapter='forge-0.6C', backend='docker-compatible',
+                     enforced_guarantees=list(GUARANTEES), unverified_guarantees=[])
+        return ExecutionResult(status if code in (None, 0) else 'failed',
+                               'synthetic_container_result', audit, True, code,
+                               stdout, stderr, artifacts)

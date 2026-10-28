@@ -209,61 +209,69 @@ Codex, shell task, merge, deployment, production, existing credentials, or exist
 project is used. The temporary manifest is verified and then removed with all
 fixture state; the server is terminated and reaped even on failure.
 
-## Forge 0.6B — isolated runtime foundation (fail closed)
+## Forge 0.6C — container-backed synthetic fixtures
 
-`forge.runtime` separates trusted local runtime configuration from untrusted job
-content. It is deliberately disconnected from dispatch and the server execution
-lease APIs. Real Claude/Codex execution remains disabled, with no enable switch.
-No server settings, production code, credentials or services are changed.
+Real agent execution and server leases remain disabled. Dispatch and manager are
+unchanged. No descriptions, repository code, shell commands or credentials enter
+the runtime. There is no host execution fallback, image pull, build or installation.
 
-```python
-from forge.runtime import Runtime, SyntheticRequest, detect_capabilities
+`ContainerAdapter(ContainerConfig(executable, socket, image))` accepts an explicit
+canonical Docker-compatible CLI, local Unix daemon socket (including OrbStack),
+and an operator-audited local Python image identified by `repository@sha256:` plus
+64 hex characters. Provisioning and auditing that image are operator tasks. The
+image must contain `/usr/local/bin/python3`, support Linux cgroup v2, declare no
+volumes, and have no environment except PATH. There is no default trusted digest;
+an arbitrary image from an untrusted job must never be configured.
 
-inventory = detect_capabilities()  # passive executable discovery only
-runtime = Runtime(['/private/local/work/explicit-task-directory'])
-result = runtime.execute(SyntheticRequest('/private/local/work/explicit-task-directory'))
-manifest = result.manifest()  # JSON serializable audit; unsupported, started=False
+Call `adapter.conform()` before passing it to
+`Runtime([canonical_disposable_directory], container=adapter)`. Attestation is
+process-local, never loaded from a manifest or job. Absent conformance, daemon
+capabilities, image, or effective restrictions, execution returns unsupported.
+Conformance failures raise; they cannot enable the adapter. No CLI availability
+check authorizes execution. The daemon ID is pinned and rechecked for every run.
+
+Only exact approved, identity-pinned, empty directories strictly below the system
+temporary directory are admitted. **No host directory is mounted or copied.**
+The workspace parameter is an admission token; fixture files live in a bounded
+container tmpfs and disappear on removal. Existing worktrees and nonempty paths
+are refused. This intentionally narrower synthetic interface avoids exposing Git
+metadata, home, registry or secrets through bind mounts or symlinks.
+
+Containers use network none, read-only root, UID/GID 65534, all capabilities
+dropped, no-new-privileges, private IPC/PID namespaces, CPU/memory/swap/PID bounds,
+no devices and no host mounts. The adapter checks daemon capability reporting,
+local image identity, and effective container configuration before start. A
+minimal host environment and empty Docker configuration prevent context selection
+and registry credential helpers. Only fixed runner-owned Python fixtures run.
+The trusted CLI and daemon, audited image, host kernel and operator account remain
+part of the trust boundary; a compromised daemon is outside these guarantees.
+
+Capture drains both streams incrementally with byte caps and no engine log files.
+Artifacts are emitted by the fixed fixture as a bounded tar stream without extraction; traversal, links,
+devices, duplicate names, count and byte overflows are refused. Cancellation and
+monotonic deadlines request container stop (TERM then engine KILL), followed by
+forced removal and an engine query confirming absence. Cleanup uncertainty poisons
+the adapter and never returns success. Host CLI subprocesses are also bounded and
+reaped. Results do not retain partial capture when interrupted. Supervision errors
+return unsupported with no enforced guarantees; a failed run may have started a
+fixture before such an error, so refusal conservatively marks started when the adapter was attested. Cleanup failure requires operator investigation.
+
+Run offline checks with the commands above. Live disposable conformance is opt-in:
+
+```sh
+FORGE_TEST_DOCKER=/canonical/path/to/docker \
+FORGE_TEST_SOCKET=/canonical/path/to/docker.sock \
+FORGE_TEST_IMAGE=audited-repository@sha256:<audited-digest> \
+python3 -m unittest discover -s tests -p test_container.py -v
 ```
 
-The approved list is explicit trusted operator configuration of exact directories;
-parent approval does not approve children. Paths must be canonical, contain no
-symlink components, and retain recorded ancestor device/inode identities. These
-checks are defense in depth, **not isolation or execution authorization**. A
-worktree and a preparation manifest are never security boundaries or permits.
-Worktree contents are never opened, imported, or executed by this module.
-
-Inventory detects Docker (including an OrbStack-provided Docker CLI), Podman,
-nerdctl, macOS sandbox-exec, and bubblewrap executables without invoking them.
-Presence does not verify a daemon, VM sharing, filesystem isolation, network
-isolation, resource enforcement or process-tree termination. All mechanisms are
-reported unverified and unsupported. There is no approved container adapter in
-this milestone and no host execution fallback. No images are pulled or built.
-
-Only runner-owned synthetic identifiers are accepted: noop, capture-fixture,
-artifact-fixture, timeout-fixture, cancel-fixture and resource-fixture. These
-reserve future fixed test implementations; they do not execute today. Requests
-have no command, shell, description, environment, credential or mount fields.
-Network must be literal False. Workspace access is explicitly ro or rw. CPU,
-memory, process, wall-time, termination-grace, stdout/stderr byte and artifact
-count/total-byte requests have finite positive upper bounds; invalid or unsupported
-configurations are rejected. Valid requests return structured `unsupported`.
-A trusted Cancellation signal can return `canceled` before start.
-
-Results include status, reason, started flag, empty bounded capture fields and a
-JSON audit manifest recording requested limits, capabilities, and explicitly
-unverified guarantees. The manifest is returned to the trusted caller, not written
-into an untrusted workspace. It contains no job descriptions or credentials and
-is not an execution permit. This runtime neither claims nor acknowledges leases.
-
-**Actually enforced:** no execution, no network connections, no mount creation,
-no credential loading, exact workspace admission, synthetic operation allowlist,
-configuration bounds and empty capture. **Unverified / release blockers:** actual
-read/write filesystem boundary, home/credential exclusion during execution,
-network denial inside a runtime, CPU/memory/process limits, monotonic wall-time
-kill, streaming capture/artifact limits, and graceful cancellation followed by
-forced termination of an entire isolated process tree. The interface documents
-these future backend obligations; it does not simulate successful enforcement.
-Tests verify timeout/cancellation/resource/capture requests fail closed, not that
-an OS enforces those limits. Enabling a backend requires disposable isolation
-conformance tests, including hostile symlinks and cleanup failures, plus separate
-lease integration and durable execution fencing. No agent execution is authorized.
+The live test performs filesystem/root and symlink escape probes, network denial,
+nonroot/capability checks, cgroup CPU/memory/PID checks, fork/memory exhaustion,
+timeout, ignored-TERM child termination, cancellation, bounded capture, artifact
+collection and container removal. Offline tests verify admission, configuration,
+artifact traversal rejection and cleanup refusal; they do not prove OS isolation.
+The live suite skips unless all three explicit settings are supplied. A skipped
+suite is **unverified**, never a successful conformance result. This development
+session found the OrbStack CLI but daemon socket access was denied; no actual
+container isolation guarantee was verified here. No production or control-plane
+changes are required or authorized by this milestone.
