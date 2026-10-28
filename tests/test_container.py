@@ -27,6 +27,69 @@ def archive(name='result.txt', kind=tarfile.REGTYPE, content=b'fixture'):
 
 
 class ContainerTests(unittest.TestCase):
+    def test_image_identity_races_refused_before_start(self):
+        iid = 'sha256:' + 'a' * 64
+        other = 'sha256:' + 'b' * 64
+        cid = 'c' * 64
+        ref = 'example.invalid/fixture@sha256:' + 'd' * 64
+        limits = Limits()
+        image = dict(Id=iid, RepoDigests=[ref], Config={})
+        host = dict(NetworkMode='none', ReadonlyRootfs=True, Privileged=False,
+                    CapDrop=['ALL'], IpcMode='private', NanoCpus=int(limits.cpu * 1000000000),
+                    Memory=limits.memory_bytes, MemorySwap=limits.memory_bytes,
+                    PidsLimit=limits.processes, SecurityOpt=['no-new-privileges:true'],
+                    Tmpfs={'/workspace': 'rw,noexec,nosuid,nodev,size=16m,mode=1777'})
+        import copy
+        for swap in ('initial', 'created', 'config_tag', 'before_start', 'container_swap', 'bad_create', 'none'):
+            with self.subTest(swap=swap), patch.object(ContainerConfig, 'validate'):
+                adapter = ContainerAdapter(ContainerConfig('/docker', '/socket', ref, iid))
+                calls = []
+                counts = {'image': 0, 'inspect': 0}
+                def cli(args, **kwargs):
+                    calls.append(args)
+                    if args[0] == 'create':
+                        self.assertIn(iid, args)
+                        self.assertIn('--pull=never', args)
+                        return 0, (b'bad' if swap == 'bad_create' else cid.encode()), b''
+                    return 0, b'', b''
+                def inspect(args):
+                    counts[args[0]] += 1
+                    if args[0] == 'image':
+                        result = copy.deepcopy(image)
+                        if swap == 'initial' or swap == 'before_start' and counts['image'] == 2:
+                            result['Id'] = other
+                    else:
+                        result = dict(Id=cid, Image=iid, Config=dict(Image=iid, User='65534:65534'),
+                                      HostConfig=host, State=dict(Running=False, ExitCode=0))
+                        if swap == 'created' or swap == 'container_swap' and counts['inspect'] == 2:
+                            result['Image'] = other
+                        if swap == 'config_tag': result['Config']['Image'] = 'fixture:latest'
+                    return [result]
+                with patch.object(adapter, '_cli', side_effect=cli), patch.object(adapter, '_json', side_effect=inspect):
+                    if swap == 'none':
+                        self.assertEqual(adapter._run('probe', limits)[:2], ('completed', 0))
+                    else:
+                        with self.assertRaises(SafetyError): adapter._run('probe', limits)
+                if swap == 'none':
+                    self.assertIn(['start', '--attach', cid], calls)
+                else:
+                    self.assertFalse(any(args[0] == 'start' for args in calls))
+                self.assertTrue(any(args[0] == 'rm' for args in calls))
+                self.assertFalse(adapter._failed)
+
+    def test_canonical_orbstack_binary_still_requires_checked_path(self):
+        canonical = '/Applications/OrbStack.app/Contents/MacOS/xbin/docker-tools'
+        with patch('forge.container.checked_path', side_effect=lambda value: Path(value)) as checked, \
+                patch.object(Path, 'is_file', return_value=True), \
+                patch.object(Path, 'is_socket', return_value=True), patch('os.access', return_value=True):
+            ContainerConfig(canonical, '/socket', 'fixture@sha256:' + 'a' * 64).validate()
+            checked.assert_any_call(canonical)
+            with self.assertRaises(SafetyError):
+                ContainerConfig('/other/docker-tools', '/socket', 'fixture@sha256:' + 'a' * 64).validate()
+        with patch('forge.container.checked_path', side_effect=SafetyError('unsafe path')):
+            with self.assertRaises(SafetyError):
+                ContainerConfig(canonical, '/socket', 'fixture@sha256:' + 'a' * 64).validate()
+
     def test_artifact_traversal_and_links(self):
         for name, kind in (('../secret', tarfile.REGTYPE), ('/secret', tarfile.REGTYPE),
                            ('link', tarfile.SYMTYPE), ('hard', tarfile.LNKTYPE),

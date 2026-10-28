@@ -24,14 +24,20 @@ class ContainerConfig:
     executable: str
     socket: str
     image: str
+    expected_id: str = None
 
     def validate(self):
         binary = checked_path(self.executable)
         endpoint = checked_path(self.socket)
-        if binary.name != 'docker' or not binary.is_file() or not os.access(binary, os.X_OK) or not endpoint.is_socket():
+        orbstack = '/Applications/OrbStack.app/Contents/MacOS/xbin/docker-tools'
+        if ((binary.name != 'docker' and str(binary) != orbstack)
+                or not binary.is_file() or not os.access(binary, os.X_OK)
+                or not endpoint.is_socket()):
             raise SafetyError('local container executable and Unix socket required')
         if not re.fullmatch(r'[a-z0-9][a-z0-9./:_-]*@sha256:[0-9a-f]{64}', self.image):
             raise SafetyError('audited image must have an immutable digest')
+        if self.expected_id is not None and not re.fullmatch(r'sha256:[0-9a-f]{64}', self.expected_id):
+            raise SafetyError('valid audited image ID required')
 
 
 # Never interpolated with repository content, descriptions, or caller commands.
@@ -39,6 +45,7 @@ FIXTURE = r'''
 import os, sys, time, socket, resource
 op = sys.argv[1]
 if op == 'probe':
+    assert sys.executable == '/usr/local/bin/python3' and sys.version_info >= (3, 9)
     assert os.getuid() == 65534
     status = open('/proc/self/status').read()
     assert 'CapEff:\t0000000000000000' in status
@@ -94,6 +101,7 @@ class ContainerAdapter:
         self._attested = False
         self._daemon = None
         self._failed = False
+        self._image_id = config.expected_id
 
     def _cli(self, args, *, timeout=10, caps=(1048576, 1048576), cancellation=None):
         # Empty Docker configuration prevents credential helpers, contexts/plugins,
@@ -144,26 +152,45 @@ class ContainerAdapter:
         if self._daemon is not None and self._daemon != daemon:
             raise SafetyError('daemon identity changed')
         self._daemon = daemon
-        image = self._json(['image', 'inspect', self.config.image])[0]
-        if (self.config.image not in image.get('RepoDigests', []) or image['Config'].get('Volumes')
+        self._check_image()
+
+    def _check_image(self):
+        image, = self._json(['image', 'inspect', self.config.image])
+        image_id = image.get('Id', '')
+        if (not re.fullmatch(r'sha256:[0-9a-f]{64}', image_id)
+                or (self._image_id is not None and image_id != self._image_id)
+                or self.config.image not in image.get('RepoDigests', []) or image['Config'].get('Volumes')
                 or any(not value.startswith('PATH=') for value in image['Config'].get('Env') or [])):
-            raise SafetyError('image digest, volumes or environment refused')
+            raise SafetyError('image digest, ID, volumes or environment refused')
+        self._image_id = image_id
+
+    def _inspect_container(self, container):
+        obj, = self._json(['inspect', container])
+        if (obj.get('Id') != container or obj.get('Image') != self._image_id
+                or obj.get('Config', {}).get('Image') != self._image_id):
+            raise SafetyError('created container image identity mismatch')
+        return obj
 
     def _run(self, operation, limits, cancellation=None):
         name = 'forge-fixture-' + uuid.uuid4().hex
         created = False
+        container = name
         try:
+            self._check_image()
             args = ['create', '--pull=never', '--name', name, '--network=none', '--read-only',
                     '--cap-drop=ALL', '--security-opt=no-new-privileges:true', '--user=65534:65534',
                     '--cpus=' + str(limits.cpu), '--memory=' + str(limits.memory_bytes),
                     '--memory-swap=' + str(limits.memory_bytes), '--pids-limit=' + str(limits.processes),
                     '--ipc=private', '--log-driver=none', '--tmpfs=/workspace:rw,noexec,nosuid,nodev,size=16m,mode=1777',
-                    '--entrypoint=/usr/local/bin/python3', self.config.image,
+                    '--entrypoint=/usr/local/bin/python3', self._image_id,
                     '-I', '-B', '-c', FIXTURE, operation]
-            code, _, _ = self._cli(args)
+            code, out, _ = self._cli(args)
             if code: raise SafetyError('container creation refused')
             created = True
-            obj = self._json(['inspect', name])[0]
+            container = out.decode('ascii').strip()
+            if not re.fullmatch(r'[0-9a-f]{64}', container):
+                raise SafetyError('valid created container ID required')
+            obj = self._inspect_container(container)
             host, cfg = obj['HostConfig'], obj['Config']
             if not (host['NetworkMode'] == 'none' and host['ReadonlyRootfs'] is True
                     and host['Privileged'] is False and host['CapDrop'] == ['ALL']
@@ -178,16 +205,18 @@ class ContainerAdapter:
                     and not obj.get('Mounts')
                     and host['Tmpfs'] == {'/workspace': 'rw,noexec,nosuid,nodev,size=16m,mode=1777'}):
                 raise SafetyError('effective container restrictions mismatch')
+            self._check_image()
+            self._inspect_container(container)
             status = 'completed'
             try:
-                code, out, err = self._cli(['start', '--attach', name], timeout=limits.wall_seconds,
+                code, out, err = self._cli(['start', '--attach', container], timeout=limits.wall_seconds,
                                           caps=((limits.artifact_bytes + 65536) if operation == 'artifact-fixture' else limits.stdout_bytes, limits.stderr_bytes), cancellation=cancellation)
             except TimeoutError:
                 status = 'canceled' if cancellation and cancellation.requested else 'timeout'
-                self._cli(['stop', '--time', str(max(1, int(limits.grace_seconds))), name],
+                self._cli(['stop', '--time', str(max(1, int(limits.grace_seconds))), container],
                           timeout=limits.grace_seconds + 3)
                 code, out, err = None, b'', b''
-            state = self._json(['inspect', name])[0]['State']
+            state = self._inspect_container(container)['State']
             if state['Running']: raise SafetyError('container still running')
             if status == 'completed': code = state['ExitCode']
             artifacts = ()

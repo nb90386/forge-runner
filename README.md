@@ -290,6 +290,11 @@ and remaining execution blockers.
 
 ## Forge 0.6F — operator live isolation conformance
 
+For the ARM64 fixture Dockerfile, explicit setup/audit/live commands, local
+prerequisite audit, digest provenance requirements, and cleanup instructions, see
+[the operator setup](tools/container-fixture/README.md). The setup is opt-in and
+does not enable agents or deployment. No trusted base digest is bundled.
+
 The separate `forge.conformance` command runs the existing fixed disposable
 container probes directly; it does not rely on unittest success or skip counts.
 It never enables agents or connects container attestation to leases. Images must

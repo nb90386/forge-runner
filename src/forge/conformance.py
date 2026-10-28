@@ -10,7 +10,7 @@ from .runtime import detect_capabilities
 CHECKS = ('prerequisites', 'daemon_and_local_image', 'disposable_isolation')
 
 
-def run(*, executable=None, socket=None, image=None, approved_images=(), live=False):
+def run(*, executable=None, socket=None, image=None, approved_images=(), live=False, expected_id=None):
     report = {'schema_version': 1, 'milestone': 'forge-0.6F',
               'status': 'UNVERIFIED', 'real_agent_execution': False,
               'execution_authorized': False,
@@ -35,7 +35,7 @@ def run(*, executable=None, socket=None, image=None, approved_images=(), live=Fa
             report['status'] = 'FAIL'
             report['reason'] = 'image_not_explicitly_approved'
             return report
-        adapter = ContainerAdapter(ContainerConfig(executable, socket, image))
+        adapter = ContainerAdapter(ContainerConfig(executable, socket, image, expected_id))
         report['checks'][stage] = 'PASS'
         stage = 'daemon_and_local_image'
         adapter._check_daemon()
