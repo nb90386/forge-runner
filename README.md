@@ -177,5 +177,34 @@ here and remain execution blockers. Live tunnel/service deployment and productio
 smoke validation are also outside this offline change; no deployed worker has
 been switched to this adapter.
 
-Tests use disposable Git repositories and scripted HTTP/socket responses only.
-They do not bind sockets, contact production, read credentials, or install packages.
+Unit tests use disposable Git repositories and scripted HTTP/socket responses.
+The final staging integration additionally starts the local control plane and uses
+real loopback HTTP:
+
+```sh
+python3 tests/test_staging_integration.py
+```
+
+Requires the local control checkout at
+`~/Forge/projects/forge-control-development`, Python 3.10+ (required by the
+control plane), Git, and permission to
+bind a loopback listener. No installation is needed. Unittest discovery also runs
+this test. A sandbox that denies socket binding will report a failure, not a pass
+or skip; run the command in an environment allowing loopback to complete validation.
+
+The harness uses a fresh committed repository, separate temporary control-plane
+SQLite data and runner registry, synthetic distinct worker/operator tokens, and an
+OS-assigned port on `127.0.0.1`. It starts the real server in an isolated interpreter
+to separate the two `forge` packages, authenticates an operator session, verifies
+worker approval refusal, polls through `LoopbackTransport`, explicitly binds the
+local repository, and prepares one worktree. Repeated polling and reconstruction
+of the dispatcher must return the same manifest without another worktree. Archive
+must hide the feed entry and refuse replay of the cached approval with HTTP 403.
+
+Assertions cover original content/HEAD/branch, manifest and registry digests,
+SQLite approval/audit history, and an empty execution queue. The server forbids
+subprocesses and outgoing connections; the runner phase restricts subprocesses to
+local Git preparation/inspection and connections to the test listener. No Claude,
+Codex, shell task, merge, deployment, production, existing credentials, or existing
+project is used. The temporary manifest is verified and then removed with all
+fixture state; the server is terminated and reaped even on failure.
