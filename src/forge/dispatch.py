@@ -1,17 +1,15 @@
-"""Fail-closed approved-job adapter. No live HTTP implementation or job execution.
-
-Transport is deliberately injectable and mock-only until Forge supplies the
-approval envelope documented in README. Secrets are supplied in memory by the
-existing worker, never loaded from disk by this module.
-"""
+"""Bounded read-only control-plane integration; preparation only, never execution."""
 import copy
 import hashlib
+import http.client
 import json
 import math
+import socket
 import re
 import time
 from datetime import datetime, timezone
 from typing import Protocol
+from urllib.parse import urlsplit
 
 from .git import git
 from .safety import SafetyError, task_id
@@ -85,57 +83,171 @@ def validate(job, now):
     return digest(job)
 
 
-class DispatchClient:
-    """Read-only client; token provider reuses the worker's existing token in memory.
+class LoopbackTransport:
+    """Direct numeric-loopback HTTP only. No DNS, proxy support or redirects.
 
-    Only MockTransport is enabled in this milestone. A production transport must
-    be reviewed after the API contract is extended, rather than opting in here.
+    The local operator must provide a trusted tunnel/listener and explicit port.
+    Loopback HTTP is not authentication of the remote end of that tunnel.
     """
+    MAX_BODY = 921600
+
+    def __init__(self, base_url):
+        try:
+            url = urlsplit(base_url)
+            if (url.scheme != 'http' or url.hostname not in ('127.0.0.1', '::1')
+                    or url.username is not None or url.password is not None
+                    or url.path or url.query or url.fragment or url.port is None
+                    or not 1 <= url.port <= 65535
+                    or base_url != 'http://' + ('[::1]' if url.hostname == '::1' else '127.0.0.1') + ':' + str(url.port)):
+                fail("explicit numeric loopback origin and port required")
+            self.host, self.port = url.hostname, url.port
+        except (ValueError, TypeError):
+            fail("invalid loopback origin")
+
+    def get(self, path, *, bearer_token, timeout):
+        if not isinstance(path, str) or not (
+                re.fullmatch(r'/api/worker/approved-jobs\?limit=100&after=(0|[1-9][0-9]{0,18})', path)
+                or re.fullmatch(r'/api/worker/approval-authorization\?approval_id=[a-z0-9][a-z0-9-]{0,47}&envelope_digest=[0-9a-f]{64}', path)):
+            fail("unexpected metadata path")
+        connection = http.client.HTTPConnection(self.host, self.port, timeout=timeout)
+        sock = socket.socket(socket.AF_INET6 if self.host == '::1' else socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.settimeout(timeout)
+            # Numeric address and fixed address family avoid name resolution entirely.
+            sock.connect((self.host, self.port))
+            if sock.getpeername()[:2] != (self.host, self.port):
+                fail("unexpected network destination")
+            connection.sock = sock
+            connection.request('GET', path, headers={'Authorization': 'Bearer ' + bearer_token,
+                                                    'Accept': 'application/json'})
+            response = connection.getresponse()
+            if response.status != 200:
+                return response.status, b''
+            if response.getheader('Content-Encoding', 'identity') != 'identity':
+                fail("unsupported metadata encoding")
+            length = response.getheader('Content-Length')
+            if length is not None:
+                if not re.fullmatch(r'[0-9]+', length) or len(length) > 10 or int(length) > self.MAX_BODY:
+                    fail("metadata response exceeds bounds")
+            body = response.read(self.MAX_BODY + 1)
+            if length is not None and len(body) != int(length):
+                fail("incomplete metadata response")
+            if len(body) > self.MAX_BODY:
+                fail("metadata response exceeds bounds")
+            return response.status, body
+        finally:
+            connection.close()
+            sock.close()
+
+
+class DispatchClient:
+    """Supply the existing worker token callable; credentials stay in memory."""
+    MAX_PAGES = 100
+    MAX_BYTES = 32 * 1024 * 1024
+    MAX_JOBS = 10000
+
     def __init__(self, transport, token_provider, *, timeout=10, attempts=3, sleep=time.sleep):
-        if type(transport) is not MockTransport:
-            fail("live transport disabled: production approval contract incomplete")
+        if type(transport) not in (MockTransport, LoopbackTransport):
+            fail("unsupported metadata transport")
         if (not isinstance(timeout, (int, float)) or not math.isfinite(timeout)
                 or not 0 < timeout <= 30 or type(attempts) is not int or not 1 <= attempts <= 3):
             fail("invalid timeout or retry bounds")
         self.transport, self.token_provider = transport, token_provider
         self.timeout, self.attempts, self.sleep = timeout, attempts, sleep
 
-    def poll(self):
-        for attempt in range(self.attempts):
+    def _request(self, path, *, retry=True):
+        for attempt in range(self.attempts if retry else 1):
             try:
                 token = self.token_provider()
-                if not isinstance(token, str) or not token or any(c.isspace() for c in token):
+                if not isinstance(token, str) or not token or not all(33 <= ord(c) <= 126 for c in token):
                     fail("worker token unavailable")
-                status, body = self.transport.get('/api/ui/implementation-jobs?status=approved',
-                                                   bearer_token=token, timeout=self.timeout)
+                status, body = self.transport.get(path, bearer_token=token, timeout=self.timeout)
             except SafetyError:
-                raise
+                raise SafetyError("dispatch: metadata transport refused") from None
             except Exception:
                 status, body = 503, b''
+            if type(status) is not int:
+                fail("invalid HTTP status")
             if status == 200:
+                if not isinstance(body, bytes) or len(body) > LoopbackTransport.MAX_BODY:
+                    fail("metadata response exceeds bounds")
                 try:
-                    if not isinstance(body, bytes) or len(body) > 1024 * 1024:
-                        fail("metadata response exceeds bounds")
-                    payload = json.loads(body)
-                    if (not isinstance(payload, dict) or set(payload) != {'jobs'}
-                            or not isinstance(payload['jobs'], list) or len(payload['jobs']) > 200):
-                        fail("invalid metadata response")
-                    jobs = copy.deepcopy(payload['jobs'])
-                    for job in jobs:
-                        validate(job, time.time())
-                    return jobs
-                except (ValueError, TypeError):
+                    def unique(pairs):
+                        result = {}
+                        for key, value in pairs:
+                            if key in result:
+                                raise ValueError()
+                            result[key] = value
+                        return result
+                    payload = json.loads(body.decode('utf-8'), object_pairs_hook=unique)
+                except (ValueError, TypeError, RecursionError):
                     fail("invalid JSON metadata")
-            if status not in (429, 502, 503, 504):
-                fail("metadata request refused (HTTP %s)" % (status if type(status) is int else 'invalid'))
+                return payload, len(body)
+            if not retry or status not in (429, 502, 503, 504):
+                fail("metadata request refused (HTTP %s)" % status)
             if attempt + 1 < self.attempts:
                 self.sleep(0.1 * (2 ** attempt))
         fail("metadata service unavailable after bounded retries")
 
+    def poll(self):
+        after, total = 0, 0
+        jobs, approvals, job_ids = [], {}, set()
+        for _ in range(self.MAX_PAGES):
+            payload, size = self._request('/api/worker/approved-jobs?limit=100&after=' + str(after))
+            total += size
+            if (total > self.MAX_BYTES or not isinstance(payload, dict)
+                    or set(payload) != {'schema_version', 'jobs', 'next_cursor'}
+                    or type(payload['schema_version']) is not int or payload['schema_version'] != 1
+                    or not isinstance(payload['jobs'], list) or len(payload['jobs']) > 100):
+                fail("invalid or unbounded feed")
+            for job in payload['jobs']:
+                fingerprint = validate(job, time.time())
+                key = job['approval']['id']
+                if key in approvals:
+                    if approvals[key] != fingerprint:
+                        fail("inconsistent approval in feed")
+                    continue  # Exact envelope replay is idempotent, never a second job.
+                if job['job_id'] in job_ids:
+                    fail("job associated with multiple approvals in feed")
+                approvals[key] = fingerprint
+                job_ids.add(job['job_id'])
+                jobs.append(copy.deepcopy(job))
+                if len(jobs) > self.MAX_JOBS:
+                    fail("job count exceeds bounds")
+            cursor = payload['next_cursor']
+            if cursor is None:
+                for job in jobs:
+                    validate(job, time.time())
+                return jobs
+            if type(cursor) is not int or not after < cursor <= 9223372036854775807:
+                fail("nonmonotonic feed cursor")
+            after = cursor
+        fail("incomplete feed: page bound exceeded")
+
+    def authorize(self, job):
+        fingerprint = validate(job, time.time())
+        key = job['approval']['id']
+        # Authorization is never retried or cached: fail at this boundary.
+        payload, _ = self._request('/api/worker/approval-authorization?approval_id=' + key
+                                   + '&envelope_digest=' + fingerprint, retry=False)
+        expected = {'schema_version': 1, 'authorized': True, 'approval_id': key,
+                    'envelope_digest': fingerprint}
+        if (not isinstance(payload, dict) or payload != expected
+                or type(payload.get('schema_version')) is not int
+                or payload.get('authorized') is not True):
+            fail("current authorization mismatch")
+        validate(job, time.time())
+
 
 class Dispatcher:
-    def __init__(self, manager, *, clock=time.time):
-        self.manager, self.clock = manager, clock
+    def __init__(self, manager, client=None, *, clock=time.time):
+        self.manager, self.client, self.clock = manager, client, clock
+
+    def _authorize(self, job):
+        if type(self.client) is not DispatchClient:
+            fail("current authorization client required")
+        self.client.authorize(job)
+        validate(job, self.clock())
 
     def bind(self, project_id, repository_id, repository_identity):
         """Explicit local operator configuration, never called from remote data."""
@@ -188,6 +300,7 @@ class Dispatcher:
                 path = m._validate_worktree(repo, task)
                 if git(path, 'rev-parse', '--verify', 'HEAD^{commit}') != job['commit_sha']:
                     fail("prepared worktree commit changed")
+                self._authorize(job)
                 return copy.deepcopy(manifest)
             if any(r.get('job_id') == job['job_id'] for r in records.values()):
                 fail("job already associated with another approval")
@@ -199,14 +312,15 @@ class Dispatcher:
             # Intent survives every failure, including a crash after Git succeeds.
             records[key] = {'state': 'preparing', 'fingerprint': fingerprint, 'job_id': job['job_id']}
             m.registry.checkpoint(data)
+            self._authorize(job)
             created = m._create_locked(data, repo_id, local_task, commit=job['commit_sha'])
-            validate(job, self.clock())  # expiry during preparation leaves a blocked intent
+            self._authorize(job)  # revocation/expiry leaves durable blocked intent
             manifest = {'schema_version': 1, 'job_id': job['job_id'], 'project_id': job['project_id'],
                         'repository_id': repo_id, 'repository_identity': job['repository_identity'],
                         'commit_sha': job['commit_sha'], 'worktree_path': created['path'],
                         'local_task_id': local_task, 'approval': job['approval'],
                         'audit': {'prepared_at': datetime.fromtimestamp(self.clock(), timezone.utc).isoformat(),
-                                  'envelope_sha256': fingerprint, 'adapter': 'forge-0.5B',
-                                  'execution': False, 'transport': 'mock-only'}}
+                                  'envelope_sha256': fingerprint, 'adapter': 'forge-0.5D',
+                                  'execution': False, 'transport': type(self.client.transport).__name__}}
             records[key].update(state='prepared', manifest=manifest, manifest_sha256=digest(manifest))
             return copy.deepcopy(manifest)
