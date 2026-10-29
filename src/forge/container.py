@@ -5,14 +5,11 @@ The operator supplies an audited, locally provisioned Python image by digest.
 """
 from dataclasses import dataclass
 import io
+import inspect
 import json
 import os
-from pathlib import Path
 import re
-import selectors
-import subprocess
 import tarfile
-import tempfile
 import time
 import uuid
 
@@ -66,6 +63,80 @@ class ContainerConfig:
             raise SafetyError('valid audited image ID required')
 
 
+def cgroup_membership(read):
+    """Resolve an unescaped, complete host v2 hierarchy; fail on hidden ancestry."""
+    def path(value):
+        if (not value.startswith('/') or '\\' in value or
+                any(c.isspace() or ord(c) < 32 for c in value) or
+                value != '/' and any(p in ('', '.', '..') for p in value[1:].split('/'))):
+            raise ValueError('invalid cgroup path')
+        return value
+    membership = read('/proc/self/cgroup').splitlines()
+    if len(membership) != 1 or not membership[0].startswith('0::/'):
+        raise ValueError('ambiguous cgroup membership')
+    member = path(membership[0][3:])
+    mountinfo = read('/proc/self/mountinfo')
+    mounts = []
+    for line in mountinfo.splitlines():
+        fields = line.split()
+        if ' - cgroup2 ' not in line:
+            continue
+        if fields.count('-') != 1:
+            raise ValueError('invalid mount evidence')
+        split = fields.index('-')
+        if split < 6 or len(fields) != split + 4:
+            raise ValueError('invalid mount evidence')
+        root, mount = path(fields[3]), path(fields[4])
+        if root != '/' or mount == '/':
+            raise ValueError('complete cgroup ancestry required')
+        mounts.append(mount)
+    if len(mounts) != 1 or member == '/':
+        raise ValueError('unique nonroot membership required')
+    mount = mounts[0]
+    # An overmount could make reads refer to an unrelated filesystem.
+    for line in mountinfo.splitlines():
+        fields = line.split()
+        if len(fields) < 6:
+            raise ValueError('invalid mount evidence')
+        other = path(fields[4])
+        if other.startswith(mount + '/') or other == mount and ' - cgroup2 ' not in line:
+            raise ValueError('obscured cgroup evidence')
+    if (read('/proc/self/cgroup').splitlines() != membership or
+            read('/proc/self/mountinfo') != mountinfo):
+        raise ValueError('changed cgroup membership')
+    return mount, member
+
+
+def verify_cgroups(cpu, memory, pids, read):
+    """Evaluate limits from membership through every nonroot ancestor."""
+    from fractions import Fraction
+    mount, path = cgroup_membership(read)
+    original = mount, path
+    effective = [None, None, None]
+    while path != '/':
+        base = mount + path
+        for index, name in enumerate(('cpu.max', 'memory.max', 'pids.max')):
+            fields = read(base + '/' + name).split()
+            if index == 0:
+                if len(fields) != 2 or not fields[1].isdigit() or int(fields[1]) <= 0:
+                    raise ValueError('invalid cpu evidence')
+                denominator = int(fields[1])
+            else:
+                if len(fields) != 1: raise ValueError('invalid limit evidence')
+                denominator = 1
+            if fields[0] == 'max': continue
+            if not fields[0].isdigit() or int(fields[0]) <= 0:
+                raise ValueError('invalid limit evidence')
+            value = Fraction(int(fields[0]), denominator)
+            effective[index] = value if effective[index] is None else min(value, effective[index])
+        path = path.rsplit('/', 1)[0] or '/'
+    if cgroup_membership(read) != original:
+        raise ValueError('changed cgroup evidence')
+    if any(value is None or value > requested for value, requested in
+           zip(effective, (Fraction(str(cpu)), memory, pids))):
+        raise ValueError('effective cgroup limits too weak')
+
+
 # Never interpolated with repository content, descriptions, or caller commands.
 FIXTURE = r'''
 import os, sys, time, socket, resource
@@ -86,9 +157,8 @@ if op == 'probe':
     s = socket.socket(); s.settimeout(.2)
     try: s.connect(('192.0.2.1', 80)); raise AssertionError('network allowed')
     except OSError: pass
-    for name in ('cpu.max', 'memory.max', 'pids.max'):
-        value = open('/sys/fs/cgroup/' + name).read().strip()
-        assert value and value.split()[0] != 'max'
+    verify_cgroups(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]),
+                   lambda path: open(path).read())
     print('conformant')
 elif op == 'capture-fixture':
     os.write(1, b'x' * 2097152); os.write(2, b'y' * 2097152)
@@ -100,21 +170,62 @@ elif op == 'artifact-fixture':
 elif op in ('timeout-fixture', 'cancel-fixture'):
     import signal
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    reader, writer = os.pipe()
     if os.fork() == 0:
+        os.close(reader)
+        os.write(writer, b'child-started')
+        os.close(writer)
         while True: time.sleep(1)
+    os.close(writer)
+    assert os.read(reader, 64) == b'child-started'
+    os.close(reader)
+    print('forge-parent-and-child-started', flush=True)
     while True: time.sleep(1)
 elif op == 'resource-fixture':
+    import errno, signal
+    def event(controller, key):
+        assert cgroup_membership(lambda path: open(path).read()) == (mount, member)
+        with open(base + '/' + controller + '.events') as stream:
+            return dict(line.split() for line in stream)[key]
+    mount, member = cgroup_membership(lambda path: open(path).read())
+    base = mount + member
+    pids_max = int(open(base + '/pids.max').read())
+    assert 0 < pids_max <= 256
+    before = int(event('pids', 'max'))
     children = []
     try:
-        while True:
-            pid = os.fork()
+        # Bound the probe even if enforcement is broken.
+        for _ in range(pids_max):
+            try:
+                pid = os.fork()
+            except OSError as exc:
+                assert exc.errno == errno.EAGAIN
+                assert int(event('pids', 'max')) > before
+                break
             if pid == 0: time.sleep(60); os._exit(0)
             children.append(pid)
-    except OSError: pass
+        else: raise AssertionError('pids unbounded')
     finally:
         for pid in children: os.kill(pid, 9); os.waitpid(pid, 0)
-    try: a = bytearray(536870912); raise AssertionError('memory unbounded')
-    except MemoryError: pass
+    memory_max = int(open(base + '/memory.max').read())
+    assert 0 < memory_max <= 2147483648
+    before_max = int(event('memory', 'max'))
+    before_oom = int(event('memory', 'oom_kill'))
+    pid = os.fork()
+    if pid == 0:
+        try:
+            a = bytearray(memory_max * 2)
+        except MemoryError:
+            os._exit(42)
+        os._exit(0)
+    _, status = os.waitpid(pid, 0)
+    # A cgroup limit commonly kills the allocating child rather than returning
+    # ENOMEM to Python. Neither SIGKILL nor MemoryError alone proves enforcement.
+    assert int(event('memory', 'max')) > before_max
+    assert (os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL
+            and int(event('memory', 'oom_kill')) > before_oom
+            or os.WIFEXITED(status) and os.WEXITSTATUS(status) == 42)
+
 '''
 
 
@@ -128,50 +239,40 @@ class ContainerAdapter:
         self._daemon = None
         self._failed = False
         self._image_id = config.expected_id
+        self._diagnostic = None
 
-    def _cli(self, args, *, timeout=10, caps=(1048576, 1048576), cancellation=None):
-        # Empty Docker configuration prevents credential helpers, contexts/plugins,
-        # proxy variables and caller DOCKER_HOST from entering this boundary.
-        with tempfile.TemporaryDirectory(prefix='forge-docker-') as config_dir:
-            env = {'PATH': '/usr/bin:/bin', 'HOME': config_dir, 'DOCKER_CONFIG': config_dir}
-            command = [self.config.executable, '--host', 'unix://' + self.config.socket, *args]
-            with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, env=env, cwd=config_dir,
-                                  start_new_session=True) as proc:
-                streams = selectors.DefaultSelector()
-                output = [bytearray(), bytearray()]
-                for index, stream in enumerate((proc.stdout, proc.stderr)):
-                    os.set_blocking(stream.fileno(), False)
-                    streams.register(stream, selectors.EVENT_READ, index)
-                deadline = time.monotonic() + timeout
-                try:
-                    while streams.get_map():
-                        if time.monotonic() >= deadline or cancellation and cancellation.requested:
-                            raise TimeoutError('container supervision interrupted')
-                        for key, _ in streams.select(.05):
-                            chunk = os.read(key.fd, 16384)
-                            if not chunk:
-                                streams.unregister(key.fileobj)
-                            else:
-                                target = output[key.data]
-                                target.extend(chunk[:max(0, caps[key.data] - len(target))])
-                    code = proc.wait(timeout=max(.01, deadline - time.monotonic()))
-                finally:
-                    streams.close()
-                    if proc.poll() is None:
-                        proc.terminate()
-                        try: proc.wait(timeout=.2)
-                        except subprocess.TimeoutExpired: proc.kill(); proc.wait()
-                return code, bytes(output[0]), bytes(output[1])
+    def diagnostic(self):
+        """Only allowlisted runner-owned codes cross the reporting boundary."""
+        value = self._diagnostic
+        if (type(value) is tuple and len(value) == 3
+                and all(type(part) is str for part in value)
+                and value[0] in ('daemon', 'probe', 'resource-fixture', 'timeout-fixture',
+                                 'capture-fixture', 'artifact-fixture', 'cancel-fixture')
+                and value[1] in ('daemon_check', 'image_check', 'create', 'create_id',
+                                 'restrictions', 'identity_recheck', 'start', 'stop',
+                                 'exit_state', 'artifacts', 'result', 'cleanup_remove',
+                                 'cleanup_confirm')
+                and value[2] in ('refused', 'interrupted', 'result_mismatch')):
+            return dict(probe=value[0], stage=value[1], code=value[2])
+        return dict(probe='unknown', stage='unknown', code='refused')
 
-    def _json(self, args):
-        code, out, _ = self._cli(args)
+    def _cli(self, args, *, timeout=10, caps=(1048576, 1048576), cancellation=None, on_started=None):
+        """Legacy internal operation vocabulary; never executes a host command."""
+        from .engine import Engine
+        if not hasattr(self, '_engine'):
+            self._engine = Engine(self.config.socket)
+        return self._engine.operation(args, timeout=timeout, caps=caps,
+                                cancellation=cancellation, on_started=on_started)
+
+    def _json(self, args, *, timeout=10):
+        code, out, _ = self._cli(args, timeout=timeout)
         if code: raise SafetyError('container engine refused')
         return json.loads(out)
 
     def _check_daemon(self):
         info = self._json(['info', '--format', '{{json .}}'])
         if (info.get('OSType') != 'linux' or not info.get('ID')
+                or type(info.get('ID')) is not str
                 or not all(info.get(k) is True for k in ('MemoryLimit', 'SwapLimit', 'CpuCfsQuota', 'PidsLimit'))):
             raise SafetyError('required daemon limits unavailable')
         daemon = info['ID']
@@ -190,38 +291,64 @@ class ContainerAdapter:
             raise SafetyError('image digest, ID, volumes or environment refused')
         self._image_id = image_id
 
-    def _inspect_container(self, container):
-        obj, = self._json(['inspect', container])
+    def _inspect_container(self, container, *, timeout=10):
+        obj, = self._json(['inspect', container], timeout=timeout)
         if (obj.get('Id') != container or obj.get('Image') != self._image_id
                 or obj.get('Config', {}).get('Image') != self._image_id):
             raise SafetyError('created container image identity mismatch')
         return obj
 
+    @staticmethod
+    def _timestamp(value):
+        from datetime import datetime
+        if (type(value) is not str or re.fullmatch(
+                r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z', value)
+                is None or value.startswith('0001-')):
+            return False
+        try:
+            datetime.strptime(value[:19], '%Y-%m-%dT%H:%M:%S')
+            return True
+        except ValueError:
+            return False
+
     def _run(self, operation, limits, cancellation=None):
+        if self._failed:
+            raise SafetyError('adapter poisoned by cleanup failure')
+        if operation == 'noop': operation = 'probe'
+        limits.validate()
+        if operation not in ('probe', 'resource-fixture', 'timeout-fixture', 'cancel-fixture',
+                             'capture-fixture', 'artifact-fixture'):
+            raise SafetyError('fixed synthetic operation required')
         name = 'forge-fixture-' + uuid.uuid4().hex
         created = False
         container = name
+        stage = 'image_check'
         try:
             self._check_image()
             args = ['create', '--pull=never', '--name', name, '--network=none', '--read-only',
                     '--cap-drop=ALL', '--security-opt=no-new-privileges:true', '--user=65534:65534',
                     '--cpus=' + str(limits.cpu), '--memory=' + str(limits.memory_bytes),
                     '--memory-swap=' + str(limits.memory_bytes), '--pids-limit=' + str(limits.processes),
-                    '--ipc=private', '--log-driver=none', '--tmpfs=/workspace:rw,noexec,nosuid,nodev,size=16m,mode=1777',
+                    '--ipc=private', '--cgroupns=host', '--log-driver=none', '--tmpfs=/workspace:rw,noexec,nosuid,nodev,size=16m,mode=1777',
                     '--entrypoint=/usr/local/bin/python3', self._image_id,
-                    '-I', '-B', '-c', FIXTURE, operation]
+                    '-I', '-B', '-c', inspect.getsource(cgroup_membership) + inspect.getsource(verify_cgroups) + FIXTURE,
+                    operation, str(limits.cpu), str(limits.memory_bytes), str(limits.processes)]
+            stage = 'create'
             code, out, _ = self._cli(args)
             if code: raise SafetyError('container creation refused')
             created = True
+            stage = 'create_id'
             container = out.decode('ascii').strip()
             if not re.fullmatch(r'[0-9a-f]{64}', container):
                 raise SafetyError('valid created container ID required')
+            stage = 'restrictions'
             obj = self._inspect_container(container)
             host, cfg = obj['HostConfig'], obj['Config']
             if not (host['NetworkMode'] == 'none' and host['ReadonlyRootfs'] is True
                     and host['Privileged'] is False and host['CapDrop'] == ['ALL']
                     and not host.get('CapAdd') and not host.get('Binds')
                     and not host.get('Devices') and not host.get('DeviceRequests')
+                    and host.get('CgroupnsMode') == 'host'
                     and host.get('PidMode', '') == '' and host.get('IpcMode') == 'private'
                     and cfg['User'] == '65534:65534'
                     and host['NanoCpus'] == int(limits.cpu * 1000000000)
@@ -231,65 +358,106 @@ class ContainerAdapter:
                     and not obj.get('Mounts')
                     and host['Tmpfs'] == {'/workspace': 'rw,noexec,nosuid,nodev,size=16m,mode=1777'}):
                 raise SafetyError('effective container restrictions mismatch')
+            stage = 'identity_recheck'
             self._check_image()
             self._inspect_container(container)
             status = 'completed'
+            started = False
+            run_deadline = time.monotonic() + limits.wall_seconds
+            def startup():
+                nonlocal started
+                if cancellation and cancellation.requested:
+                    raise SafetyError('pre-start cancellation')
+                remaining = run_deadline - time.monotonic()
+                if remaining <= 0: raise SafetyError('startup deadline elapsed')
+                state = self._inspect_container(container, timeout=remaining)['State']
+                if time.monotonic() >= run_deadline:
+                    raise SafetyError('startup deadline elapsed')
+                if (state.get('Running') is not True or type(state.get('Pid')) is not int
+                        or state['Pid'] <= 0 or state.get('Status') != 'running'
+                        or not self._timestamp(state.get('StartedAt'))):
+                    raise SafetyError('startup unconfirmed')
+                started = True
+                if cancellation: cancellation.cancel()
             try:
+                stage = 'start'
                 code, out, err = self._cli(['start', '--attach', container], timeout=limits.wall_seconds,
-                                          caps=((limits.artifact_bytes + 65536) if operation == 'artifact-fixture' else limits.stdout_bytes, limits.stderr_bytes), cancellation=cancellation)
+                                          caps=((limits.artifact_bytes + 65536) if operation == 'artifact-fixture' else limits.stdout_bytes, limits.stderr_bytes), cancellation=cancellation,
+                                          on_started=startup if operation in ('timeout-fixture', 'cancel-fixture') else None)
             except TimeoutError:
                 status = 'canceled' if cancellation and cancellation.requested else 'timeout'
+                stage = 'stop'
                 self._cli(['stop', '--time', str(max(1, int(limits.grace_seconds))), container],
                           timeout=limits.grace_seconds + 3)
+                if operation in ('timeout-fixture', 'cancel-fixture') and not started:
+                    raise SafetyError('startup evidence missing')
                 code, out, err = None, b'', b''
+            stage = 'exit_state'
             state = self._inspect_container(container)['State']
-            if state['Running']: raise SafetyError('container still running')
+            if (state.get('Running') is not False or state.get('Dead', False) is not False
+                    or type(state.get('Pid')) is not int or state['Pid'] != 0
+                    or type(state.get('ExitCode')) is not int
+                    or state.get('Status') != 'exited'
+                    or not self._timestamp(state.get('StartedAt'))
+                    or not self._timestamp(state.get('FinishedAt'))):
+                raise SafetyError('container termination unconfirmed')
             if status == 'completed': code = state['ExitCode']
             artifacts = ()
             if operation == 'artifact-fixture' and code == 0:
+                stage = 'artifacts'
                 artifacts = collect_artifacts(out, limits)
                 out = b''
             return status, code, out, err, artifacts
+        except (Exception, KeyboardInterrupt) as exc:
+            self._diagnostic = (operation, stage,
+                                'interrupted' if isinstance(exc, KeyboardInterrupt) else 'refused')
+            raise
         finally:
             # Even a failed create may have allocated the name. Removal is always
             # attempted; inability to confirm absence permanently poisons adapter.
-            self._failed = True
-            rc, _, _ = self._cli(['rm', '--force', name])
-            check, remaining, _ = self._cli(['ps', '--all', '--filter', 'name=^/' + name + '$', '--format', '{{.Names}}'])
-            if (created and rc) or check != 0 or remaining.strip():
+            stage = 'cleanup_remove'
+            try:
+                rc, _, _ = self._cli(['rm', '--force', name])
+                stage = 'cleanup_confirm'
+                check, remaining, _ = self._cli(['ps', '--all', '--filter', 'name=^/' + name + '$', '--format', '{{.Names}}'])
+                if (created and rc) or check != 0 or remaining.strip():
+                    if created and rc:
+                        stage = 'cleanup_remove'
+                    raise SafetyError('container cleanup unconfirmed')
+            except BaseException as exc:
+                # Any interrupted teardown leaves absence unconfirmed, including
+                # SystemExit. Preserve the interruption after recording poison.
                 self._failed = True
-                raise SafetyError('container cleanup unconfirmed')
-            self._failed = False
+                self._diagnostic = (operation, stage,
+                                    'interrupted' if not isinstance(exc, Exception) else 'refused')
+                raise
 
     def conform(self):
         """Real disposable probes only; never persisted or inferred from inventory."""
         from .runtime import Cancellation, Limits
-        from threading import Timer
         self._attested = False
         if self._failed:
             raise SafetyError('adapter poisoned by cleanup failure')
+        self._diagnostic = ('daemon', 'daemon_check', 'refused')
         self._check_daemon()
         limits = Limits(wall_seconds=3, grace_seconds=1)
-        probe = self._run('probe', limits)
-        resources = self._run('resource-fixture', limits)
-        timeout = self._run('timeout-fixture', limits)
-        if probe[:2] != ('completed', 0) or resources[:2] != ('completed', 0) or timeout[0] != 'timeout':
-            raise SafetyError('live conformance failed')
-        capture = self._run('capture-fixture', limits)
-        artifact = self._run('artifact-fixture', limits)
+
+        def check(operation, valid, cancellation=None):
+            self._diagnostic = (operation, 'start', 'refused')
+            result = self._run(operation, limits, cancellation)
+            self._diagnostic = (operation, 'result', 'result_mismatch')
+            if not valid(result) or self._failed:
+                raise SafetyError('live conformance failed')
+
+        check('probe', lambda r: r[:2] == ('completed', 0))
+        check('resource-fixture', lambda r: r[:2] == ('completed', 0))
+        check('timeout-fixture', lambda r: r[0] == 'timeout')
+        check('capture-fixture', lambda r: r[1] == 0 and len(r[2]) == limits.stdout_bytes
+              and len(r[3]) == limits.stderr_bytes)
+        check('artifact-fixture', lambda r: r[4] == (('result.txt', b'synthetic artifact\n'),))
         signal = Cancellation()
-        timer = Timer(.5, signal.cancel)
-        timer.start()
-        try:
-            canceled = self._run('cancel-fixture', limits, signal)
-        finally:
-            timer.cancel()
-            timer.join()
-        if (capture[1] != 0 or len(capture[2]) != limits.stdout_bytes
-                or len(capture[3]) != limits.stderr_bytes
-                or artifact[4] != (('result.txt', b'synthetic artifact\n'),)
-                or canceled[0] != 'canceled' or self._failed):
-            raise SafetyError('capture, artifact or cancellation conformance failed')
+        check('cancel-fixture', lambda r: r[0] == 'canceled', signal)
+        self._diagnostic = None
         self._attested = True
 
     def execute(self, request, cancellation):

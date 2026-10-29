@@ -243,7 +243,7 @@ no devices and no host mounts. The adapter checks daemon capability reporting,
 local image identity, and effective container configuration before start. A
 minimal host environment and empty Docker configuration prevent context selection
 and registry credential helpers. Only fixed runner-owned Python fixtures run.
-The trusted CLI and daemon, audited image, host kernel and operator account remain
+The trusted daemon, audited image, host kernel and operator account remain
 part of the trust boundary; a compromised daemon is outside these guarantees.
 
 Capture drains both streams incrementally with byte caps and no engine log files.
@@ -251,8 +251,7 @@ Artifacts are emitted by the fixed fixture as a bounded tar stream without extra
 devices, duplicate names, count and byte overflows are refused. Cancellation and
 monotonic deadlines request container stop (TERM then engine KILL), followed by
 forced removal and an engine query confirming absence. Cleanup uncertainty poisons
-the adapter and never returns success. Host CLI subprocesses are also bounded and
-reaped. Results do not retain partial capture when interrupted. Supervision errors
+the adapter and never returns success. The Engine transport launches no host subprocesses. Results do not retain partial capture when interrupted. Supervision errors
 return unsupported with no enforced guarantees; a failed run may have started a
 fixture before such an error, so refusal conservatively marks started when the adapter was attested. Cleanup failure requires operator investigation.
 
@@ -290,6 +289,23 @@ and remaining execution blockers.
 
 ## Forge 0.6F — operator live isolation conformance
 
+The runtime and conformance adapter now use a private standard-library Docker
+Engine API v1.45 transport over the explicitly approved canonical Unix socket.
+No Docker CLI process is spawned. Only fixed inspection, fixture creation,
+attach/start, stop, forced removal and absence queries are permitted. Image
+pulls, builds, exec, registry access, remote endpoints and network fallback are
+unsupported. The legacy executable configuration field is still validated for
+compatibility; it is never executed by this adapter.
+
+Startup requires a complete newline-terminated stdout marker from the trusted
+fixture plus genuine running state, PID and start timestamp. Capture caps do not
+truncate evidence. Partial, malformed, trailing, duplicate and stderr evidence
+fails closed. Termination requires exited state, zero PID and start/finish
+timestamps; forced removal and an empty exact-name query confirm cleanup.
+Cleanup uncertainty permanently poisons the adapter. Offline tests do not attest
+the daemon: operator live conformance remains required. Real agent execution
+stays disabled and lease behavior is unchanged.
+
 For the ARM64 fixture Dockerfile, explicit setup/audit/live commands, local
 prerequisite audit, digest provenance requirements, and cleanup instructions, see
 [the operator setup](tools/container-fixture/README.md). The setup is opt-in and
@@ -302,8 +318,8 @@ be independently audited and provisioned locally by the operator. There is no
 trusted default image, pull, build, dependency installation or credential discovery.
 Only the explicitly selected digest is inspected; other local images are not
 implicitly approved. Docker/OrbStack executable inventory is passive and never
-proves daemon availability or isolation. OrbStack uses its Docker-compatible CLI
-and an explicit canonical Unix socket; no Docker context is read.
+proves daemon availability or isolation. OrbStack is accessed through its
+explicit canonical Unix socket; no Docker context is read.
 
 On your Mac, substitute the three audited local values and run from this checkout:
 

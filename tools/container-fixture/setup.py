@@ -49,6 +49,8 @@ def inspect_image(adapter, reference, expected_id=None, fixture=False):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('action', choices=('build', 'audit', 'live'))
+    p.add_argument('--diagnostics', action='store_true',
+                   help='live only: fixed, redacted local failure codes')
     p.add_argument('--docker', required=True)
     p.add_argument('--socket', required=True)
     p.add_argument('--base', help='independently trusted, already local base digest')
@@ -57,6 +59,8 @@ def main(argv=None):
     p.add_argument('--image', help='independently provisioned fixture repository digest')
     p.add_argument('--expected-id', help='sha256 image ID printed by build')
     args = p.parse_args(argv)
+    if args.diagnostics and args.action != 'live':
+        p.error('--diagnostics requires live')
     try:
         reference = args.base if args.action == 'build' else args.image
         pinned(reference or '')
@@ -100,7 +104,8 @@ def main(argv=None):
                               'status': 'UNVERIFIED', 'reason': 'metadata_only'}))
             return 0
         report = run(executable=args.docker, socket=args.socket, image=args.image,
-                     approved_images=(args.image,), live=True, expected_id=args.expected_id)
+                     approved_images=(args.image,), live=True, expected_id=args.expected_id,
+                     diagnostics=args.diagnostics)
         print(json.dumps(report, sort_keys=True))
         return 0 if report['status'] == 'PASS' else 1
     except SafetyError as exc:

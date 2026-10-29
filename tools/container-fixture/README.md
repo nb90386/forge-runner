@@ -1,5 +1,12 @@
 # Operator setup for ARM64 synthetic conformance
 
+**Current status: ready for an operator synthetic live test; isolation unverified.**
+Runtime, audit and live conformance use a private Docker Engine API v1.45 client
+over the approved OrbStack Unix socket, without Docker CLI subprocesses. Only
+fixed synthetic operations are supported. The legacy `build` action is refused
+by this client; provision the independently audited fixture separately. Real
+agent execution remains disabled. No daemon was contacted during this repair.
+
 Run from the runner checkout. No step authorizes agent execution, leases or a
 production deployment. The setup script never pulls, pushes, logs in, mounts host
 paths, discovers credentials or starts a service. Only `build` builds; only `live`
@@ -146,6 +153,42 @@ Neither result is an agent execution permit. LEASES.md blockers remain unchanged
 
 ## Diagnostics and cleanup
 
+For a live failure, opt in to local redacted diagnostics using the same audited
+configuration and approved image:
+
+```sh
+python3 tools/container-fixture/setup.py live --diagnostics \
+  --docker "$DOCKER" --socket "$SOCKET" \
+  --image "$IMAGE" --expected-id "$EXPECTED_ID"
+```
+
+The flag is live-only, defaults off, and adds one fixed `diagnostic` object on
+conformance failure. `probe` identifies `daemon` or one of the six fixed probes;
+`stage` identifies daemon/image checks, create/ID, restrictions, identity recheck,
+start/stop, exit state, artifact parsing, result validation, or cleanup
+remove/confirmation. `code` is only `refused`, `interrupted`, or
+`result_mismatch`. Unknown details become `unknown`/`refused`. Cleanup failure
+takes precedence over an earlier probe failure because absence is unconfirmed.
+Expected timeout/cancellation is validated as a result, not reported as a failure.
+A result mismatch does not reveal the internal assertion or raw exit status.
+No Docker stderr, container output, exception text, environment, credentials,
+image metadata, or discovered host paths are included in diagnostic JSON.
+Detected executable paths are omitted and engine candidates become booleans in
+this mode. Setup preflight failures retain their fixed refusal messages.
+
+Failures leave all eight guarantees UNVERIFIED and both execution flags false.
+Diagnostics do not authorize execution or change the fixture, restrictions,
+identity checks, deadlines, cancellation, or cleanup. Do not loosen protections
+in response to a code. For example, `probe/restrictions/refused` means the
+inspected effective configuration was refused; it does not establish which
+field differs. `probe/result/result_mismatch` means the fixed isolation probe
+did not complete successfully; Python/UID/capability/no-new-privileges, filesystem,
+network, and cgroup checks can all fail inside that probe. Resource exhaustion,
+capture bounds, artifact validation, timeout and cancellation each have a
+separate probe identifier. A stage code narrows investigation without asserting
+the cause of the observed local failure.
+
+
 ### Docker 29 digest metadata compatibility
 
 Setup and runtime compare repository digest evidence after Docker Hub name
@@ -232,3 +275,72 @@ failure (sandbox denied loopback bind) and 11 skips. The focused setup tests,
 including the additional mocked build-context test, passed; actual Unix socket
 binding was denied and skipped. Compilation and diff checks passed. These are
 offline results, not evidence of Docker image or isolation validity.
+
+### Resource-result mismatch investigation
+
+The old resource fixture expected a 512 MiB allocation under a 256 MiB cgroup
+limit to raise Python `MemoryError`. Linux may instead OOM-kill the allocating
+process. Exit 137 alone cannot distinguish this from another SIGKILL. The updated
+fixture allocates in a child and requires memory-limit event evidence; an OOM
+kill additionally requires an increased `oom_kill` counter. PID exhaustion must
+raise EAGAIN with an increased `pids.events:max`, and forks are bounded even if
+enforcement is absent. Missing event support fails closed.
+
+To distinguish the original allocation assumption from other local failures,
+run this disposable memory-only diagnostic with the same previously audited
+`DOCKER`, `SOCKET`, `IMAGE` and `EXPECTED_ID` values. It uses the adapter's normal
+restrictions, digest/ID checks, deadline and confirmed removal. It neither
+attests conformance nor authorizes execution. No image is pulled or built.
+
+```sh
+PYTHONPATH=src python3 - <<'PY'
+import json, os
+import forge.container as container
+from forge.runtime import Limits
+adapter = container.ContainerAdapter(container.ContainerConfig(
+    os.environ['DOCKER'], os.environ['SOCKET'], os.environ['IMAGE'],
+    os.environ['EXPECTED_ID']))
+adapter._check_daemon()
+container.FIXTURE = '''
+import os
+assert os.getuid() == 65534
+assert int(open('/sys/fs/cgroup/memory.max').read()) == 268435456
+try:
+    a = bytearray(536870912)
+except MemoryError:
+    print('allocation-refused', flush=True)
+else:
+    raise AssertionError('allocation succeeded')
+'''
+inspect = adapter._inspect_container
+def observe(cid):
+    obj = inspect(cid)
+    state = obj.get('State', {})
+    if state.get('Status') == 'exited':
+        print(json.dumps({'oom_killed': state.get('OOMKilled'),
+                          'exit_code': state.get('ExitCode')}))
+    return obj
+adapter._inspect_container = observe
+result = adapter._run('resource-fixture', Limits(wall_seconds=3, grace_seconds=1))
+print(json.dumps({'status': result[0], 'exit_code': result[1]}))
+PY
+```
+
+`oom_killed=true` with exit 137 supports the original probe-assumption failure.
+Timeout or a different exit requires further investigation; it is not PASS.
+Successful allocation is a resource enforcement failure. A zero exit in this
+diagnostic means only that Python received MemoryError; full live conformance
+must still pass with the updated event checks.
+
+Effective-limit evidence now requires a host-rooted cgroup v2 mount and an
+unambiguous membership path. The probe reads cpu.max, memory.max and pids.max
+through the entire ancestry, compares the minimum CPU quota/period ratio and
+byte/process limits against the exact request, and refuses missing evidence.
+Hosts that hide or omit ancestor controller files remain unverified.
+Timeout and cancellation require a child-to-parent pipe handshake, an attached
+startup marker, and a running-container inspection before termination.
+Cancellation requires a complete newline-terminated marker and genuine running
+state with a PID and start timestamp. The attached stream remains open while the
+fixture runs; partial markers never count. Exit state requires zero PID and
+start/finish timestamps. Cleanup requires forced removal and an empty exact-name
+lookup. No host CLI supervisor or subprocess is used by runtime or conformance.
