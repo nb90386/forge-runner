@@ -205,7 +205,9 @@ class LeaseWorker:
     def _save(self, state, generation):
         with self.registry.locked(write=True) as data:
             row = data['lease_records'][self._job['job_id']]
-            row.update(state=state, generation=generation)
+            if row['state'] == 'blocked' and state != 'blocked':
+                refuse()
+            row.update(state=state, generation=max(row['generation'], generation))
 
     def claim(self, job, attempt_key):
         with self._lock:
