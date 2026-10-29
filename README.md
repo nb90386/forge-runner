@@ -360,3 +360,16 @@ python3 -m compileall -q src tests
 
 The lease HTTP tests use only synthetic loopback authorities and can skip when
 loopback binding is denied; those skips provide no live isolation evidence.
+
+## Forge 0.7 — local synthetic supervisor increment
+
+`forge.supervisor` now connects the local mock lease state machine to the verified
+synthetic Runtime through an explicit one-shot operator approval bound to the
+exact envelope, task, attempt and request. Independent watchdog and heartbeat
+lanes revoke authority on cancellation, expiry, stale generation or uncertainty.
+Runtime retains its existing isolated fixed fixtures and confirmed cleanup checks.
+Results are redacted counts and binding metadata; interrupted attempts remain
+fenced across restart. Real agent execution remains disabled. This API does not
+contact production, prepare repositories or integrate the HTTP lease worker.
+See [LEASES.md](LEASES.md#forge-07-first-local-synthetic-supervisor-increment)
+for scope, timing limits, tests and the required disposable live integration gate.

@@ -152,3 +152,98 @@ conformance with confirmed removal. Missing prerequisites and skips cannot attes
 isolation. Reports do not authorize execution, satisfy lease supervisor blockers,
 or connect Runtime/ContainerAdapter to either lease worker. All 0.6D/0.6E execution
 refusals and remaining integration requirements above remain in force.
+
+## Forge 0.7: first local synthetic supervisor increment
+
+`forge.supervisor.SyntheticSupervisor(registry, mock_transport, worker_id,
+ fake_clock, runtime)` connects the concrete local mock lease state machine to
+`Runtime`. `run(job, attempt_key, request, approval)` is one-shot, including after
+refusal. The caller must explicitly supply a `SyntheticApproval` with literal
+`approved=True`, the full envelope digest, exact task ID, attempt-key digest and
+`request_digest(request)`. This is trusted local operator configuration, not an
+approval inferred from dispatch content. The dispatch operator approval is also
+validated before any claim. Existing worker `execute` methods still refuse.
+
+The supervisor claims, acknowledges, obtains fresh heartbeat authority, saves
+synthetic intent, then invokes only the typed synthetic Runtime. No preparation,
+Git, repository content, agents, HTTP services or credential discovery is involved.
+Runtime still requires process-local live conformance of the exact typed adapter,
+immutable image checks and the approved Unix socket. It admits only empty temporary
+workspace tokens and mounts no host content. No conformance bit is persisted.
+
+A separate 20 ms scheduled watchdog signals cancellation independently of caller,
+registry and transport locks. It observes both the mock monotonic deadline and a
+conservative real monotonic deadline anchored before claim; wall rollback or a
+stalled fake clock cannot extend the real budget. Another lane polls heartbeat
+without renewal. The launch generation is pinned; remote cancellation, generation
+change, lease loss or ambiguity revokes local authority without retries. The
+existing container adapter owns bounded TERM/KILL, forced removal and confirmed
+absence. Signal detection is subject to Python scheduling; daemon operations may
+consume their existing bounded API timeouts before teardown completes. No strict
+host-suspension or interpreter-crash termination guarantee is claimed.
+
+Only confirmed Runtime outcomes with all enforced guarantees can be terminally
+reported, after a final heartbeat and generation check. Cleanup uncertainty,
+expiry, cancellation or uncertain terminal reporting leaves a durable `blocked`
+fence and raises a fixed redacted error. Results expose only binding digests,
+IDs, generation, state and bounded capture/artifact counts. No raw output,
+artifacts, workspace paths, permits or exception text leave this supervisor.
+Startup marks unresolved records blocked; neither old workers nor new instances
+may overwrite that fence. Interrupted launches are never automatically resumed,
+retried or declared cleaned up. The trusted private registry assumptions above
+still apply.
+
+This increment deliberately accepts only the local mock authority and its
+FakeClock. It is not wired to HTTPLeaseWorker, dispatch CLI or production. Offline
+integration tests replace container execution and do not attest live isolation.
+Run `PYTHONPATH=src:tests python3 -m unittest test_supervisor -q`.
+
+**Next integration gate:** explicitly configured disposable live Engine testing
+of this supervisor with a newly conformed adapter and audited immutable image:
+verify exact approval/attempt binding, revoke a lease and expire a deadline while
+a fixture is running, observe bounded stop/escalation and confirmed absence,
+inject cleanup/terminal-report uncertainty, then verify restart refuses the same
+job/approval. No skips count as PASS. Complete this local synthetic gate before
+considering HTTP lease wiring; real agents remain separately blocked on the
+OS-supervised crash watchdog and other release requirements above.
+
+### Disposable live supervisor gate
+
+Run the dedicated module directly from the runner checkout with all four
+operator-approved values (the executable is validated but never executed):
+
+```sh
+FORGE_TEST_DOCKER=/CANONICAL/PATH/TO/docker \
+FORGE_TEST_SOCKET=/CANONICAL/PATH/TO/docker.sock \
+FORGE_TEST_IMAGE='AUDITED-REPOSITORY@sha256:64-LOWERCASE-HEX-DIGEST' \
+FORGE_TEST_EXPECTED_ID='sha256:64-LOWERCASE-HEX-IMAGE-ID' \
+PYTHONPATH=src:tests python3 tests/test_supervisor_live_integration.py
+```
+
+The direct gate exits **0 PASS**, **1 FAIL**, or **2 SKIP/unverified**. Discovery
+also lists explicit skips, but its successful exit alone is not live evidence.
+Every case conforms a new adapter against the existing local immutable fixture;
+no images are pulled or built. Cases cover exact attempt approval, completion,
+supervisor cancellation and mock lease expiry after verified live startup,
+wall timeout, bounded TERM/KILL teardown, and actual exact-name absence queries.
+The termination fixtures ignore TERM and have a child; the existing adapter
+checks exited state and zero PID before removal. The elapsed assertion is a
+conservative 120-second scheduled-run bound covering existing daemon API bounds,
+not a scheduler-independent latency or crash guarantee.
+
+Controlled mocks suppress only fixture self-cancellation after real startup
+validation, then drive the supervisor or clock. Cleanup uncertainty is injected
+only after actual removal and empty absence confirmation. A separate checkpoint
+fault simulates local durable terminal-report failure after authority acceptance.
+Both must block and refuse replay through a reopened Registry without Engine or
+transport calls. Fault injection is not evidence of a real daemon outage, disk
+failure, power loss or interpreter-crash recovery. The local mock lease authority
+remains the only authority exercised; HTTP and real agents remain out of scope.
+
+Offline validation for this increment (skips remain unverified):
+
+```sh
+PYTHONPATH=src:tests python3 -m unittest test_supervisor test_conformance test_container.ContainerTests test_container.ResourceFixtureTests test_container.EffectiveLimitsTests test_container.TerminationEvidenceTests test_container.FailClosedContainmentTests test_engine test_runtime test_lease test_lease_http test_dispatch.ClientTests test_dispatch.HardenedClientTests test_dispatch.TransportTests test_forge.ValidationTests -q
+python3 -m compileall -q src tests
+git diff --check
+```
