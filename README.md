@@ -1,4 +1,15 @@
-# Forge 0.5 — milestone A
+# Forge runner
+
+A Python standard-library execution runner for AI coding-agent tasks, designed defensively. It approves specific local Git repositories, creates isolated task worktrees, dispatches approved jobs, and runs them in container-isolated runtimes under expiring execution leases. Every step is refuse-by-default: path and name validation, advisory locking, atomic registry writes, a minimal Git environment with hooks/fsmonitor/transport disabled, and explicit operator approval.
+
+Built incrementally from milestone 0.5 to 0.7 (October 2026); each milestone is documented below in the order it landed.
+
+- Code: `src/forge/` (safety, registry, manager, git, dispatch, engine, runtime, container, lease, lease_http, conformance, supervisor)
+- Tests: `python3 -m unittest discover -s tests` from the repo root. On 2026-11-22: 169 tests run, OK, 7 skipped (container and live-supervisor integration tests skip unless their environment settings are supplied).
+- Requirements: Python 3.9+, `/usr/bin/git`; Docker Engine only for the 0.6C+ container paths. No third-party packages.
+- Status: research-grade infrastructure; live job execution stays disabled unless an operator configures it (see each milestone's "unresolved risks").
+
+## Forge 0.5 — milestone A
 
 Python standard-library library for explicitly approved local Git repositories
 and task worktrees. Requires Python 3.9+ and `/usr/bin/git` on macOS (also tested
